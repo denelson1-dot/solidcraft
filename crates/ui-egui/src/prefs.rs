@@ -314,7 +314,7 @@ pub const DEFAULT_BROWSER_WIDTH: f32 = 250.0;
 
 // The stored fields, their defaults, page resets and simple form controls share this table.
 // Omitted pages keep fields such as grid_follows_view and added agents when restoring defaults.
-// Accepted control-channel ranges may differ from slider ranges.
+// Accepted control-channel ranges may differ from slider ranges (look_at_speed).
 macro_rules! preference_settings {
     ($( $(#[$doc:meta])* $field:ident: $ty:ty = $default:expr $(, $page:expr)? $(, accept($accepted:expr))? $(=> $control:ident($($args:tt)*))? ;)*) => {
         #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -442,6 +442,10 @@ preference_settings! {
     custom_themes: Vec<crate::theme_files::ThemeFile> = Vec::new();
     /// Interface language (a registered locale ID).
     language: String = "en".into(), 0;
+    /// Shared workspace composition; system windows and popups retain their purpose.
+    layout: crate::shell::LayoutMode = Default::default(), 0;
+    /// Show command names beneath ribbon icons, independently of workspace layout.
+    ribbon_labels: bool = true, 0 => check_tr("ui.ribbon_labels");
     /// Interface scale (1 = 100 %).
     ui_scale: f32 = 1.0, 0, accept(0.5..=2.5) => slider("ui.ui_scale", 0.5..=2.5, 0.05, |v| format!("{:.0} %", v * 100.0), "prefs:scale");
     /// Interface font: an installed font family (or a font file), or empty for the built-in one
@@ -455,8 +459,6 @@ preference_settings! {
     timeline_under_browser: bool = false, 0;
     /// Fold the shared-column history to its header.
     timeline_collapsed: bool = false, 0;
-    /// Legacy shared-column height, retained for preference compatibility.
-    timeline_left_height: f32 = 360.0, 0;
     /// Whether the browser beside the vertical history is collapsed to its rail.
     timeline_left_browser_collapsed: bool = false, 0;
     /// Width of the browser sidebar, which
@@ -473,6 +475,9 @@ preference_settings! {
     trackpad_pan: bool = true, 1;
     /// Horizontal trackpad and thumb-wheel scrolling pans the view the other way (#2007).
     pan_reverse_x: bool = false, 1 => check("Reverse horizontal pan direction", "Horizontal two-finger scrolling and the thumb wheel pan the other way");
+    /// View changes (axis view, Look At, Home) animate; `look_at_speed` scales how fast.
+    look_at_anim: bool = true, 1 => check("Animate view changes", "Axis view, Look At, Home and Fit");
+    look_at_speed: f32 = 1.0, 1, accept(0.25..=4.0) => enabled_slider(look_at_anim, "Animation speed", 0.5..=3.0, 0.25, |v| format!("{v:.2}×"));
     /// Default modelling orientation: `z` (Z up) or `y` (Y up) (#3).
     up_axis: String = "z".into(), PAGE_DESIGN;
     /// After a STEP or IGES file opens, offer to stand a Y-up part up (`stand_up`).
@@ -597,6 +602,7 @@ pub fn open_at(app: &mut SolveApp, page: usize) {
 struct Snapshot {
     prefs: Prefs,
     dark: bool,
+    layout: crate::shell::LayoutMode,
     grid: bool,
     shadow: bool,
     perspective: bool,
@@ -613,6 +619,7 @@ impl Snapshot {
         Snapshot {
             prefs: app.preferences.clone(),
             dark: app.ui.dark,
+            layout: app.ui.layout,
             grid: app.ui.show_grid,
             shadow: app.ui.ground_shadow,
             perspective: app.ui.perspective,
@@ -631,6 +638,7 @@ impl Snapshot {
         app.preferences = self.prefs;
         app.preferences.update = update;
         app.ui.dark = self.dark;
+        app.ui.layout = self.layout;
         app.ui.show_grid = self.grid;
         app.ui.ground_shadow = self.shadow;
         app.ui.perspective = self.perspective;
@@ -764,6 +772,7 @@ fn defaults(app: &mut SolveApp, page: usize) {
     match page {
         0 => {
             app.ui.dark = true;
+            app.ui.layout = app.preferences.layout;
             app.ui.agent_cursor = Default::default();
             app.autosave_minutes = 5.0;
             set_autosave(app);
@@ -1141,6 +1150,18 @@ fn page(app: &mut SolveApp, ui: &mut egui::Ui, t: &Tokens) {
                 });
             });
             theme_row(app, ui);
+            ui_kit::row(ui, app.tr("ui.workspace_layout"), |ui| {
+                let mut selected = usize::from(app.ui.layout == crate::shell::LayoutMode::Docked);
+                if ui_kit::segmented(
+                    ui,
+                    &mut selected,
+                    &[crate::i18n::tr("ui.layout_floating"), crate::i18n::tr("ui.layout_compact")],
+                    Default::default(),
+                ) {
+                    let _ = app.run("view.layout", json!({"mode": if selected == 1 { "compact" } else { "floating" }}));
+                }
+            });
+            setting::ribbon_labels(app, ui);
             setting::ui_scale(app, ui);
             if !cfg!(target_arch = "wasm32") {
                 ui_kit::row(ui, app.tr_label("Interface font"), |ui| ui_font_row(app, ui));
@@ -1162,7 +1183,7 @@ fn page(app: &mut SolveApp, ui: &mut egui::Ui, t: &Tokens) {
             });
             ui_kit::text(ui, app.tr("ui.timeline_left_note"), ui_kit::Text::Note("timeline"));
             ui_kit::row(ui, app.tr_label("Parts browser"), |ui| {
-                setting::browser_float(app, ui);
+                ui.add_enabled_ui(app.ui.layout == crate::shell::LayoutMode::Floating, |ui| setting::browser_float(app, ui));
             });
             ui_kit::text(
                 ui,
@@ -1278,6 +1299,8 @@ fn page(app: &mut SolveApp, ui: &mut egui::Ui, t: &Tokens) {
                     for (m, id, label) in MiddleDoubleClick::ALL { if ui_kit::list_picker(ui, id, crate::i18n::tr_label(label), current == m).clicked() { app.preferences.middle_double_click = id.into(); } }
                 }).on_hover_text(crate::i18n::tr_label("Double-clicking the middle button in the view: Home (the home view, framing what is shown), Fit (frame what is shown, keeping the orientation) or nothing"));
             });
+            setting::look_at_anim(app, ui);
+            setting::look_at_speed(app, ui);
             setting::space_mouse_enabled(app, ui);
             setting::space_mouse_speed(app, ui);
             // Rows say what they do to the view, through the mapping navigation uses; the choices
@@ -1861,8 +1884,8 @@ pub fn set(app: &mut SolveApp, p: &serde_json::Value) -> Result<serde_json::Valu
     if new.disabled_plugins.len() > crate::plugins::MAX_DISABLED || new.disabled_plugins.iter().any(|id| !crate::plugins::valid_id(id)) {
         return Err(format!("`disabled_plugins` must be at most {} ids of lowercase letters, digits and hyphens", crate::plugins::MAX_DISABLED));
     }
-    if !accepted::ui_scale(&new) {
-        return Err("`ui_scale` must be 0.5…2.5".into());
+    if !accepted::ui_scale(&new) || !accepted::look_at_speed(&new) {
+        return Err("`ui_scale` must be 0.5…2.5 and `look_at_speed` 0.25…4".into());
     }
     if solidcraft_engine::doc::display_quality::DisplayQuality::parse(&new.display_quality).is_none() {
         return Err("`display_quality` must be coarse, normal, fine or ultra".into());
@@ -1878,6 +1901,9 @@ pub fn set(app: &mut SolveApp, p: &serde_json::Value) -> Result<serde_json::Valu
     }
     let up_changed = new.up_axis != app.preferences.up_axis;
     let msaa_changed = new.msaa != app.preferences.msaa;
+    if p.get("layout").is_some() {
+        app.ui.layout = new.layout;
+    }
     app.preferences = new;
     if msaa_changed {
         save_graphics(app);
@@ -1921,7 +1947,7 @@ mod tests {
         let mut h = crate::scenario::Harness::new();
         let out = h.call("ui.prefs", json!({"theme": "gruvbox-dark-hard"}));
         assert_eq!(out["result"]["theme"], "gruvbox-dark-hard", "{out}");
-        assert!(out["result"]["theme_ids"].as_array().is_some_and(|ids| ids.len() == 9), "{out}");
+        assert!(out["result"]["theme_ids"].as_array().is_some_and(|ids| ids.len() == 3 + crate::theme_files::builtin().len()), "{out}");
         h.frames(2);
         let hard = crate::theme_files::find("gruvbox-dark-hard", &[]).map(crate::theme_files::resolve).unwrap();
         assert!(h.app.ui.dark);
@@ -2181,7 +2207,7 @@ mod tests {
         assert_eq!(h.app.preferences.navigator_style, NavigatorStyle::Axes);
         h.call("ui.prefs", json!({"button":"cancel"}));
         assert_eq!(h.app.preferences.navigator_style, NavigatorStyle::Cube);
-        h.call("ui.prefs", json!({"navigator_style":"axes"}));
+        h.call("ui.prefs", json!({"navigator_style":"axes", "look_at_anim":false}));
         h.call("ui.view", json!({"view":"front"}));
         let axis = crate::scenario::handle_at("axis_view:-y").unwrap();
         h.call("ui.click", json!({"x":axis.x,"y":axis.y}));
@@ -2429,7 +2455,7 @@ mod tests {
         assert!(app.ui.dark && app.preferences.theme == "dark" && app.preferences.ui_scale == 1.0 && app.preferences.zoom_to_cursor);
         assert!(app.keymap.custom.is_empty(), "a rebinding made while the dialog was open is undone too");
 
-        control(&mut app, &json!({"open": "Navigation", "nav": "alias"})).unwrap();
+        control(&mut app, &json!({"open": "Navigation", "nav": "alias", "look_at_anim": false})).unwrap();
         control(&mut app, &json!({"button": "apply"})).unwrap();
         control(&mut app, &json!({"nav": "tinkercad"})).unwrap();
         control(&mut app, &json!({"button": "cancel"})).unwrap();
@@ -2440,11 +2466,12 @@ mod tests {
             c
         };
         app.animate_to(to);
-        assert!(app.cam == to, "the view jumps");
+        assert!(app.cam_anim.is_none() && app.cam == to, "no animation: the view jumps");
 
         control(&mut app, &json!({"open": "Navigation"})).unwrap();
         control(&mut app, &json!({"button": "defaults"})).unwrap();
         assert_eq!(app.preferences.nav, "fusion");
+        assert!(app.preferences.look_at_anim);
         control(&mut app, &json!({"button": "ok"})).unwrap();
         assert!(!app.prefs_window.open);
 
@@ -2469,7 +2496,6 @@ mod tests {
 
         // Switch language to Japanese
         set(&mut app, &json!({"language": "ja", "timeline_left": true})).unwrap();
-        app.preferences.timeline_left_height = 275.0;
         app.preferences.timeline_left_browser_collapsed = true;
         assert_eq!(app.preferences.language, "ja");
         assert!(app.preferences.timeline_left);
@@ -2481,7 +2507,6 @@ mod tests {
         other.load_prefs(&app.prefs());
         assert_eq!(other.preferences.language, "ja");
         assert!(other.preferences.timeline_left);
-        assert_eq!(other.preferences.timeline_left_height, 275.0);
         assert!(other.preferences.timeline_left_browser_collapsed);
         assert_eq!(other.tr("ui.preferences"), "環境設定");
     }

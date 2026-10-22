@@ -7,6 +7,7 @@
 //! right of the viewport, the command palette and a bottom or left-sidebar feature timeline.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 #![forbid(unsafe_code)]
+use crate::ui_kit::{Container, Surface};
 
 pub mod access;
 pub mod agent_chat;
@@ -248,7 +249,7 @@ use std::sync::mpsc::Receiver;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use solidcraft_engine::Session;
-use solidcraft_engine::render::{Camera, StandardView};
+use solidcraft_engine::render::{Camera, CameraAnim, StandardView};
 
 pub use control::{ControlRequest, ControlResponse};
 
@@ -256,7 +257,7 @@ pub use control::{ControlRequest, ControlResponse};
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct UiState {
-    /// Automation-only shell mode; never persisted in preferences.
+    /// Effective shell mode; automation can override the saved preference for this session.
     pub layout: shell::LayoutMode,
     /// Ribbon tab; SHEET METAL and the contextual SKETCH join the seven design tabs.
     pub tab: String,
@@ -363,6 +364,8 @@ pub struct SolveApp {
     pub ui: UiState,
     pub(crate) shell: shell::State,
     pub cam: Camera,
+    /// A view change in progress (axis view, Home, Fit); any mouse navigation cancels it.
+    pub cam_anim: Option<CameraAnim>,
     /// Seconds since start, as of this frame.
     pub now: f64,
     /// The view before the current sketch started (Finish Sketch returns to it).
@@ -531,6 +534,7 @@ impl SolveApp {
             ui: UiState::default(),
             shell: Default::default(),
             cam: Camera::default(),
+            cam_anim: None,
             now: 0.0,
             pre_sketch_cam: None,
             pre_sketch_marker: None,
@@ -725,6 +729,7 @@ impl SolveApp {
             if !prefs::MSAA.contains(&p.msaa) {
                 p.msaa = prefs::Prefs::default().msaa;
             }
+            self.ui.layout = p.layout;
             self.preferences = p;
         }
         // Saved before the theme was a preference: the Dark/Light flag says which.
@@ -753,6 +758,12 @@ impl SolveApp {
         let r = self.session.execute(id, &params).map_err(|e| e.to_string());
         self.big_operation |= now_ms() - t0 >= recovery_ui::BIG_OPERATION_MS;
         if let Ok(v) = &r {
+            if id == "view.layout" {
+                let layout =
+                    if v.get("mode").and_then(Value::as_str) == Some("compact") { shell::LayoutMode::Docked } else { shell::LayoutMode::Floating };
+                self.preferences.layout = layout;
+                self.ui.layout = layout;
+            }
             if id == "view.history_layout" {
                 if let Some(width) = v.get("width").and_then(Value::as_f64) {
                     self.preferences.timeline_left_width = ui_kit::history_snap_width(width as f32);
@@ -903,6 +914,11 @@ impl SolveApp {
             return;
         }
         // A display toggle leaves the current modelling tool and camera in place.
+        if id == "view.layout" {
+            let mode = if self.ui.layout == shell::LayoutMode::Floating { "compact" } else { "floating" };
+            let _ = self.run(id, json!({"mode":mode}));
+            return;
+        }
         if id == "view.history_layout" {
             let _ = self.run(id, json!({}));
             return;
@@ -1241,6 +1257,7 @@ impl SolveApp {
     /// (home) and frames the model.
     pub fn set_up_axis(&mut self, up: solidcraft_engine::render::UpAxis) {
         self.ui.up_axis = up;
+        self.cam_anim = None;
         self.cam.up = up;
         self.cam.set_view(StandardView::Iso);
         self.fit_view();
@@ -1260,6 +1277,7 @@ impl SolveApp {
             }
             return;
         }
+        self.cam_anim = None;
         self.viewport.orbit_free = None;
         let bounds = viewport::view_bounds(self);
         self.pending_fit = Some((self.cam, bounds, false));
@@ -1305,19 +1323,31 @@ impl SolveApp {
                 self.animate_to(to);
             } else {
                 self.cam = to;
+                self.cam_anim = None;
             }
             ctx.request_repaint();
         }
     }
 
-    /// Move the camera to `to` at once. Views never animate: nothing is left running that a
-    /// later mouse orbit, pan or zoom could lag behind.
+    /// Move the camera to `to` over half a second (ease in-out, orientation slerped).
     pub fn animate_to(&mut self, to: Camera) {
         self.pending_fit = None;
         self.viewport.orbit_free = None;
-        if to.is_valid() {
-            self.cam = to;
+        if !to.is_valid() {
+            return;
         }
+        // Preferences › Navigation: animated (at a chosen speed) or immediate.
+        if !self.preferences.look_at_anim {
+            self.cam = to;
+            self.cam_anim = None;
+            return;
+        }
+        let mut anim = CameraAnim::new(self.cam, to, self.now);
+        let speed = f64::from(self.preferences.look_at_speed);
+        if speed.is_finite() && speed > 0.0 {
+            anim.duration /= speed;
+        }
+        self.cam_anim = Some(anim);
     }
 
     /// Frame everything shown, keeping the orientation (animated; the selection is ignored).
@@ -1399,9 +1429,10 @@ impl SolveApp {
         }
     }
 
-    /// Drop a pending refit (the user took over the camera).
+    /// Stop any view animation where it is (the user took over the camera).
     pub fn cancel_view_animation(&mut self) {
         self.pending_fit = None;
+        self.cam_anim = None;
     }
 
     /// Hand the view to an external navigation device without a pending mouse orbit or spin
@@ -1410,6 +1441,17 @@ impl SolveApp {
         self.cancel_view_animation();
         self.viewport.orbit_free = None;
         self.viewport.spin = false;
+    }
+
+    fn step_view_animation(&mut self, ctx: &egui::Context) {
+        let Some(anim) = self.cam_anim else { return };
+        let (cam, done) = anim.sample(self.now);
+        self.cam = if cam.is_valid() { cam } else { anim.to };
+        if done {
+            self.cam_anim = None;
+        } else {
+            ctx.request_repaint();
+        }
     }
 
     /// Per-frame logic before layout.
@@ -1441,6 +1483,7 @@ impl SolveApp {
         if self.cam.up != self.ui.up_axis {
             self.set_up_axis(self.ui.up_axis);
         }
+        self.step_view_animation(ctx);
         self.poll_control_jobs(ctx);
         self.drain_control(ctx);
         self.follow_view_request(true);
@@ -1546,6 +1589,7 @@ impl SolveApp {
     }
 
     fn cad_ui(&mut self, ui: &mut egui::Ui, report_input: &mut Option<issue_report::CadInput>) {
+        self.ui.layout.publish(ui.ctx());
         scenario::clear_handles();
         self.poll_deferred(ui.ctx());
         self.poll_delete_check(ui.ctx());
@@ -1568,7 +1612,7 @@ impl SolveApp {
                 return;
             }
         }
-        let floating = self.ui.layout == shell::LayoutMode::Floating;
+        let floating = ui_kit::Container::new(ui.ctx(), ui_kit::Surface::Panel).floating();
         let show_timeline = self.ui.show_timeline && !render_workspace::active(self);
         let left_timeline = show_timeline && self.preferences.timeline_left;
         timeline_left::animate_folds(self, ui.ctx());
@@ -1576,12 +1620,14 @@ impl SolveApp {
             toolbar::toolbar(self, ui);
         }
         theme::TabAccent::publish(self, ui.ctx());
+        if !floating {
+            agent_chat::show(self, ui);
+        }
         if !floating && show_timeline && !left_timeline {
             timeline::timeline(self, ui);
         }
-        // A floating browser keeps the workspace the whole width and covers viewport input.
-        let browser_float = self.ui.show_browser && (self.preferences.browser_float || floating || left_timeline);
-        if !browser_float {
+        // Browser hugs its contents in either layout; it never becomes a full-height blank column.
+        if !self.ui.show_browser {
             self.shell.browser = None;
         }
         if floating || left_timeline || !show_timeline {
@@ -1589,7 +1635,7 @@ impl SolveApp {
         }
         let full = ui.available_rect_before_wrap();
         if floating {
-            let cards = shell::Cards::new(full, self.ui.layout);
+            let cards = shell::Cards::new(full, self.ui.layout, toolbar::ribbon_height(self.preferences.ribbon_labels));
             self.shell.cards = vec![cards.workspace, cards.ribbon];
             self.shell.history = if left_timeline {
                 let below_ribbon = egui::Rect::from_min_max(egui::pos2(full.left(), cards.bottom), full.max);
@@ -1625,49 +1671,35 @@ impl SolveApp {
         if left_timeline {
             timeline_left::left_panel(self, ui);
         }
-        if self.ui.show_browser && !browser_float {
-            browser::browser(self, ui);
-        }
         if render_workspace::active(self) {
             render_workspace::panel(self, ui);
         }
-        agent_chat::show(self, ui);
-        if browser_float {
-            // The remaining content starts below the ribbon in either shell layout.
-            let viewport = ui.available_rect_before_wrap();
-            browser::floating(self, ui, viewport);
+        if self.ui.show_browser {
+            browser::browser(self, ui);
         }
-        if !floating && timeline_left::stacked(self) {
-            let width = browser::browser_width(self.preferences.browser_width) + shell::SHELL_GAP * 2.0;
-            egui::Panel::left("sc_history_browser_column").exact_size(width).resizable(false).frame(egui::Frame::NONE).show(ui, |_| {});
+        if floating {
+            agent_chat::show(self, ui);
         }
-        egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| {
-            if floating {
+        Container::new(ui.ctx(), Surface::Viewport)
+            .central()
+            .frame(Container::new(ui.ctx(), Surface::Viewport).edge_frame(egui::Color32::TRANSPARENT))
+            .show(ui, |ui| {
                 let panel_content = ui.max_rect();
-                let mut content = panel_content;
-                if let Some(history) = self.shell.history.filter(|_| !left_timeline) {
-                    content.max.y = (history.top() - shell::SHELL_GAP).max(content.top());
+                self.shell.content = Some(shell::workspace_content(self, panel_content));
+                if floating {
+                    self.shell.panels = [
+                        egui::Rect::from_min_max(egui::pos2(full.left(), panel_content.top()), egui::pos2(panel_content.left(), full.bottom())),
+                        egui::Rect::from_min_max(egui::pos2(panel_content.right(), panel_content.top()), full.max),
+                    ]
+                    .into_iter()
+                    .filter(|r| r.is_positive())
+                    .collect();
+                    viewport::refresh_layout(self, ui.ctx().pixels_per_point());
+                } else {
+                    preview::update(self, ui.ctx());
+                    self.show_workspace(ui);
                 }
-                if left_timeline && let Some(history) = self.shell.history {
-                    content.min.x = (history.right() + shell::SHELL_GAP).min(content.right());
-                }
-                if let Some(browser) = self.shell.browser {
-                    content.min.x = (browser.right() + shell::SHELL_GAP).min(content.right());
-                }
-                self.shell.content = Some(content);
-                self.shell.panels = [
-                    egui::Rect::from_min_max(egui::pos2(full.left(), panel_content.top()), egui::pos2(panel_content.left(), full.bottom())),
-                    egui::Rect::from_min_max(egui::pos2(panel_content.right(), panel_content.top()), full.max),
-                ]
-                .into_iter()
-                .filter(|r| r.is_positive())
-                .collect();
-                viewport::refresh_layout(self, ui.ctx().pixels_per_point());
-            } else {
-                preview::update(self, ui.ctx());
-                self.show_workspace(ui);
-            }
-        });
+            });
         dialogs::show(self, ui.ctx());
         issue_report::CadInput::block(self, ui, report_input);
         sketch_palette::show(self, ui.ctx());
