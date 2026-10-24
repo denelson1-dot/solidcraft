@@ -247,6 +247,8 @@ pub struct Rename {
     pub text: String,
     pub at: Pos2,
     pub(crate) focused: bool,
+    /// Edited in the browser row itself (a double-click on a body), not in the floating box.
+    pub(crate) inline: bool,
 }
 
 /// Radial slots, clockwise from the top.
@@ -761,6 +763,7 @@ fn occurrence_items(app: &SolveApp, path: &[u64]) -> Vec<Item> {
                 item.params = Some(json!({"path": path}));
             }
             "ui.export" | "ui.saveMesh" => item.params = Some(json!({"bodies": bodies})),
+            "browser.expand_all" | "browser.collapse_all" => item.params = Some(json!({"path": path})),
             _ => {}
         }
     }
@@ -851,6 +854,9 @@ fn component_items(app: &SolveApp, id: u64) -> Vec<Item> {
     v.push(act("ui.showAll", "Show All Bodies", "eye"));
     v.push(act("ui.isolate", "Isolate", "body").with(json!({ "bodies": names })).on(!bodies.is_empty() && id != 0));
     v.push(act("ui.newGroup", "New Group", "folder").with(json!({ "component": id })));
+    v.push(Item::sep());
+    v.push(cmd(app, "browser.expand_all", "Expand All").with(json!({ "component": id })));
+    v.push(cmd(app, "browser.collapse_all", "Collapse All").with(json!({ "component": id })));
     v
 }
 
@@ -1493,7 +1499,7 @@ pub fn start_rename(app: &mut SolveApp, what: RenameWhat, at: Pos2) {
         RenameWhat::View(v) => v.clone(),
         RenameWhat::Joint(j) => doc.assembly.joints.iter().find(|x| x.id == *j).map(|x| x.name.clone()).unwrap_or_default(),
     };
-    app.menu.rename = Some(Rename { what, text, at, focused: false });
+    app.menu.rename = Some(Rename { what, text, at, focused: false, inline: false });
 }
 
 pub(crate) fn commit_rename(app: &mut SolveApp, r: &Rename) {
@@ -1963,6 +1969,9 @@ fn show_rename(app: &mut SolveApp, ctx: &egui::Context) {
     // Feature-history folders own their editor inside the row. Keep the shared rename state so
     // automation and keyboard handling still use the same path, but do not draw the floating box.
     if app.preferences.timeline_left && matches!(app.menu.rename.as_ref().map(|rename| &rename.what), Some(RenameWhat::TimelineGroup(_))) {
+        return;
+    }
+    if app.menu.rename.as_ref().is_some_and(|r| r.inline) {
         return;
     }
     let Some(mut r) = app.menu.rename.take() else { return };

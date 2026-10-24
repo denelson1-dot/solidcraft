@@ -156,6 +156,7 @@ mod file_picker;
 pub(crate) mod frame_watch;
 #[cfg(test)]
 mod history_off_thread_tests;
+mod move_preview;
 pub use file_picker::FilePickerFuture;
 #[cfg(test)]
 mod blend_arrow_tests;
@@ -812,6 +813,20 @@ impl SolveApp {
                 self.preferences.layout = layout;
                 self.ui.layout = layout;
             }
+            if matches!(id, "browser.expand_all" | "browser.collapse_all") {
+                let strings = |key: &str| -> Vec<String> {
+                    v.get(key)
+                        .and_then(Value::as_array)
+                        .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).take(10_000).collect())
+                        .unwrap_or_default()
+                };
+                browser::apply_fold(
+                    self,
+                    v.get("open").and_then(Value::as_bool).unwrap_or(id == "browser.expand_all"),
+                    &strings("open_by_default"),
+                    &strings("closed_by_default"),
+                );
+            }
             if id == "view.history_layout" {
                 if let Some(width) = v.get("width").and_then(Value::as_f64) {
                     self.preferences.timeline_left_width = ui_kit::history_snap_width(width as f32);
@@ -925,6 +940,16 @@ impl SolveApp {
         }
         // A file is loading: the design waits for it.
         if self.file_load.busy() || self.file_picker.is_some() {
+            return;
+        }
+        // Front … Isometric (Ctrl+1…7 by default) turn the view as the view cube's faces do. The
+        // flat pattern is a 2D page: it has no other side to turn to.
+        if solidcraft_engine::standard_view(id).is_some() {
+            if !dialogs_sheet::flat_active(self) {
+                // `view.isometric` → "isometric", which `StandardView::parse` reads as Iso.
+                self.animate_view(id.trim_start_matches("view."));
+                self.home.open = false;
+            }
             return;
         }
         if id == "view.normal_to" {

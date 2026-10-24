@@ -393,6 +393,31 @@ fn browser_folds_are_kept_in_the_preferences() {
 }
 
 #[test]
+fn expand_and_collapse_all_open_the_browser_tree_from_the_design_menu() {
+    let mut app = sample_app();
+    let n = app.session.undo.len();
+    let root = Target::Component { id: 0 };
+    assert!(context_menu::items(&app, &root).iter().any(|i| i.label == "Expand All" && i.id == "browser.expand_all"));
+    act(&mut app, &root, "Collapse All");
+    assert!(app.tree.collapsed.contains("c0/bodies"), "{:?}", app.tree.collapsed);
+    assert!(!app.tree.collapsed.contains("c0"), "the design row stays open: {:?}", app.tree.collapsed);
+    assert_eq!(app.session.undo.len(), n);
+    act(&mut app, &root, "Expand All");
+    assert!(!app.tree.collapsed.contains("c0/bodies"), "{:?}", app.tree.collapsed);
+    assert!(app.tree.expanded.contains("origin") && app.tree.expanded.contains("c0/features"), "{:?}", app.tree.expanded);
+    assert_eq!(app.session.undo.len(), n);
+
+    let created = app.run("component.create", json!({"name": "Part"})).unwrap();
+    let occ = created["occurrence"].as_u64().unwrap();
+    let path = vec![occ];
+    act(&mut app, &Target::Occurrence { path: path.clone() }, "Collapse All");
+    assert!(app.tree.collapsed.contains(&format!("o:{occ}")), "{:?}", app.tree.collapsed);
+    assert!(!app.tree.collapsed.contains("c0/bodies"), "a placement's collapse leaves the rest of the tree: {:?}", app.tree.collapsed);
+    act(&mut app, &Target::Occurrence { path }, "Expand All");
+    assert!(!app.tree.collapsed.contains(&format!("o:{occ}")), "{:?}", app.tree.collapsed);
+}
+
+#[test]
 fn delete_key_handles_every_kind_and_asks_about_dependents() {
     use solidcraft_engine::Sel;
     let mut app = sample_app();
@@ -746,6 +771,35 @@ fn f2_renames_the_selected_item() {
     assert!(app.session.model.state().body("Base").is_some());
     app.run("select.clear", json!({})).unwrap();
     assert!(!context_menu::rename_selection(&mut app, pos2(0.0, 0.0)), "nothing selected");
+}
+
+/// A double-click on a body's browser row edits its name in the row, like F2 (no floating box);
+/// Escape cancels, and a second double-click then commits a new name.
+#[test]
+fn double_click_on_a_body_row_renames_it_in_the_row() {
+    let mut h = crate::scenario::Harness::new();
+    h.app.run("solid.box", json!({"length": 40, "width": 40, "height": 10, "body_name": "Block"})).unwrap();
+    h.app.run("select.clear", json!({})).unwrap();
+    h.frames(3);
+    let at = crate::scenario::handle_at("row:Block").expect("the body has a browser row");
+    h.call("ui.click", json!({"x": at.x, "y": at.y, "double": true}));
+    h.frames(3);
+    let rename = h.app.menu.rename.as_ref().expect("a double-click starts the rename");
+    assert!(rename.inline, "the name is edited in its row");
+    assert!(matches!(&rename.what, context_menu::RenameWhat::Body(b) if b == "Block"));
+    assert!(crate::scenario::handle_at("rename:Block").is_some(), "the row shows its name editor");
+    // Escape leaves the name alone.
+    h.step(&json!({"key": "Escape"})).unwrap();
+    h.frames(2);
+    assert!(h.app.menu.rename.is_none());
+    assert!(h.app.session.model.state().body("Block").is_some());
+    // Past egui's double-click window, so this is a new double-click and not a triple.
+    h.frames(40);
+    let at = crate::scenario::handle_at("row:Block").expect("the row is still there");
+    h.call("ui.click", json!({"x": at.x, "y": at.y, "double": true}));
+    h.frames(3);
+    assert!(context_menu::finish_rename(&mut h.app, Some("Base"), true));
+    assert!(h.app.session.model.state().body("Base").is_some());
 }
 
 #[test]
