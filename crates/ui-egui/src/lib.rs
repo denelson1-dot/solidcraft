@@ -95,6 +95,7 @@ mod measurement_ui_tests;
 mod menu_tests;
 pub(crate) mod mesh_lod;
 pub mod messages;
+pub mod occurrence_drag;
 #[cfg(test)]
 mod pattern_arrow_tests;
 #[cfg(test)]
@@ -226,9 +227,12 @@ pub mod smart_extrude;
 mod smart_extrude_ui_tests;
 pub mod space_mouse;
 pub mod space_mouse_calibration;
+pub mod space_mouse_model;
+pub mod space_mouse_offer;
 pub mod stand_up;
 #[cfg(test)]
 mod sweep_dialog_tests;
+pub(crate) mod test_boat;
 pub mod theme;
 pub mod theme_files;
 #[cfg(test)]
