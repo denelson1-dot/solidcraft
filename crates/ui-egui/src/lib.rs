@@ -138,6 +138,8 @@ mod status_tests {
 mod apply_off_thread_tests;
 mod expression_complete;
 #[cfg(test)]
+mod extrude_auto_to_object_tests;
+#[cfg(test)]
 mod extrude_edit_tests;
 mod extrude_preview;
 mod file_load;
@@ -263,6 +265,10 @@ pub struct UiState {
     pub layout: shell::LayoutMode,
     /// Ribbon tab; SHEET METAL and the contextual SKETCH join the seven design tabs.
     pub tab: String,
+    /// The toolbar tab a sketch was started from; finishing the sketch goes back to it (#3250).
+    /// Not saved: it only lives while a sketch is open.
+    #[serde(skip)]
+    pub sketch_return_tab: Option<String>,
     /// Last contextual body/sketch, only used to select on entry.
     #[serde(skip)]
     pub ribbon_context: Option<String>,
@@ -301,6 +307,7 @@ impl Default for UiState {
             layout: Default::default(),
             tab: "MODEL".into(),
             ribbon_context: None,
+            sketch_return_tab: None,
             show_browser: true,
             show_timeline: true,
             show_grid: true,
@@ -1545,6 +1552,10 @@ impl SolveApp {
         self.collect_screenshots(ctx);
         self.issue_screenshots(ctx);
         if self.issue_report.draft.is_none() && self.file_picker.is_none() {
+            // Completion owns its keys before either CAD shortcuts or text editors see them.
+            if !keymap::capturing(self) {
+                expression_complete::begin_frame(ctx);
+            }
             toolbar::shortcuts(self, ctx);
         }
         recovery_ui::tick(self);
@@ -1607,7 +1618,6 @@ impl SolveApp {
 
     /// Lay out the whole window.
     pub fn ui(&mut self, ui: &mut egui::Ui) {
-        expression_complete::begin_frame(ui.ctx());
         let t0 = now_ms();
         // The first frames draw with the bundled faces while the system's CJK, Hangul and Thai
         // faces are read on a thread; the fonts are installed again once they are there.

@@ -1526,7 +1526,14 @@ pub fn toolbar(app: &mut SolveApp, ui: &mut egui::Ui) {
                             }
                             for c in cmds {
                                 let info = c.info(&app.session);
-                                let response = crate::ui_kit::command_menu_button(ui, c.id, c.label, c.icon, c.shortcut.unwrap_or(""), info.enabled);
+                                let response = crate::ui_kit::command_menu_button(
+                                    ui,
+                                    c.id,
+                                    c.label,
+                                    c.icon,
+                                    &crate::keymap::display_for(app, c.id).unwrap_or_default(),
+                                    info.enabled,
+                                );
                                 crate::scenario::publish_handle(&format!("toolbar:{}", c.id), response.rect.center());
                                 if response.clicked() {
                                     app.start(c.id);
@@ -1621,8 +1628,7 @@ fn ribbon_tooltip(app: &SolveApp, response: egui::Response, command: &solidcraft
         let name = app.tr_label(command.label);
         let name_width =
             ui.painter().layout_no_wrap(name.to_string(), crate::fonts::semibold(crate::theme::Tokens::get().font_heading), t.text).size().x;
-        let key_width = command
-            .shortcut
+        let key_width = crate::keymap::display_for(app, command.id)
             .map(|key| {
                 ui.painter().layout_no_wrap(key.to_string(), FontId::monospace(crate::theme::Tokens::get().font_body), t.text_dim).size().x + 24.0
             })
@@ -1631,7 +1637,7 @@ fn ribbon_tooltip(app: &SolveApp, response: egui::Response, command: &solidcraft
         ui.horizontal(|ui| {
             let (rect, _) = ui.allocate_exact_size(vec2(name_width, 20.0), Sense::hover());
             ribbon_text(ui, rect.center(), name, t.font_heading, t.text, true);
-            if let Some(key) = command.shortcut {
+            if let Some(key) = crate::keymap::display_for(app, command.id) {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     egui::Frame::NONE
                         .fill(t.panel_header)
@@ -1702,8 +1708,7 @@ fn dropdown_width(app: &SolveApp, ui: &egui::Ui, cmds: &[&'static solidcraft_eng
     cmds.iter()
         .map(|c| {
             let label = ui.painter().layout_no_wrap(app.tr_label(c.label).to_string(), font.clone(), t.text).size().x;
-            let key = c
-                .shortcut
+            let key = crate::keymap::display_for(app, c.id)
                 .map(|k| ui.painter().layout_no_wrap(k.to_string(), FontId::monospace(t.font_button), t.text).size().x + 24.0)
                 .unwrap_or(0.0);
             6.0 + 20.0 + 8.0 + label + key + 30.0
@@ -1740,7 +1745,8 @@ fn dropdown_row(app: &SolveApp, ui: &mut egui::Ui, c: &'static solidcraft_engine
     let mut row = crate::ui_kit::MenuItem::new(c.id, &label, c.icon);
     row.enabled = info.enabled;
     row.highlighted = hot;
-    row.shortcut = c.shortcut.unwrap_or("");
+    let shortcut = crate::keymap::display_for(app, c.id).unwrap_or_default();
+    row.shortcut = &shortcut;
     row.paint(ui, rect, &resp, 26.0);
     if hot {
         crate::scenario::publish_handle(&format!("dropdown_hot:{}", c.id), rect.center());
@@ -1921,6 +1927,14 @@ pub fn shortcuts(app: &mut SolveApp, ctx: &egui::Context) {
     }
     // The Keyboard Shortcuts window is waiting for a key: it is not a shortcut.
     if crate::keymap::capturing(app) {
+        // Parameters is drawn before Preferences; do not let its footer see this Escape.
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+            crate::keymap::stop_capture(app);
+            app.esc_handled = true;
+        }
+        return;
+    }
+    if crate::params_dialog::cancel_on_escape(app, ctx) {
         return;
     }
     // A dimension value that is taking the keyboard: letters belong to it (a parameter name
@@ -3127,5 +3141,44 @@ mod fill_width_tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod sketch_return_tab_tests {
+    use super::*;
+
+    /// #3250: finishing a sketch goes back to the tab it was started from, not always to MODEL.
+    #[test]
+    fn finishing_a_sketch_returns_to_the_tab_it_started_from() {
+        for start in ["MODEL", "SURFACE", "ASSEMBLE", "INSERT", "INSPECT", "MANAGE", "VIEW"] {
+            let mut h = crate::scenario::Harness::new();
+            h.app.home.open = false;
+            h.app.ui.tab = start.into();
+            h.app.run("sketch.create", json!({"plane":"XY"})).unwrap();
+            assert_eq!(h.app.ui.tab, "SKETCH", "{start}: the sketch tab shows while sketching");
+            h.app.run("sketch.finish", json!({})).unwrap();
+            assert!(h.app.session.active_sketch.is_none());
+            assert_eq!(h.app.ui.tab, start, "{start}: back on the tab the sketch started from");
+        }
+    }
+
+    /// A second sketch started from another tab returns to that tab, and a start tab that is
+    /// not a normal toolbar tab (a stale name) falls back to MODEL.
+    #[test]
+    fn sketch_return_tab_follows_each_sketch_and_falls_back_to_model() {
+        let mut h = crate::scenario::Harness::new();
+        h.app.home.open = false;
+        for start in ["SURFACE", "INSPECT"] {
+            h.app.ui.tab = start.into();
+            h.app.run("sketch.create", json!({"plane":"XY"})).unwrap();
+            h.app.run("sketch.finish", json!({})).unwrap();
+            assert_eq!(h.app.ui.tab, start);
+        }
+        let start = "NO SUCH TAB";
+        h.app.ui.tab = start.into();
+        h.app.run("sketch.create", json!({"plane":"XY"})).unwrap();
+        h.app.run("sketch.finish", json!({})).unwrap();
+        assert_eq!(h.app.ui.tab, "MODEL", "{start}: falls back to MODEL");
     }
 }
