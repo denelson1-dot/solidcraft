@@ -17,6 +17,7 @@ pub mod browser;
 pub mod browser_canvas;
 pub mod browser_prompts;
 pub mod canvas;
+pub mod cli_link;
 #[cfg(test)]
 mod colour_tokens_tests;
 #[cfg(test)]
@@ -538,6 +539,15 @@ pub struct SolveApp {
     applied_ui_font: String,
     /// The fonts installed include the system's fallback faces.
     applied_system_fonts: bool,
+}
+
+impl Drop for SolveApp {
+    /// The Home pictures it started are drawn before it goes: one still on the GPU as the
+    /// process exits can crash the graphics driver.
+    fn drop(&mut self) {
+        #[cfg(not(target_arch = "wasm32"))]
+        home::finish_pictures(&mut self.home, std::time::Duration::from_secs(10));
+    }
 }
 
 impl SolveApp {

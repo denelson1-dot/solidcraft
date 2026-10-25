@@ -758,35 +758,42 @@ fn component_of(doc: &Document, occ: u64) -> Result<u64> {
     doc.occurrences.iter().find(|o| o.id == occ).map(|o| o.component).ok_or_else(|| DocError::Unknown(format!("occurrence {occ}")))
 }
 
-/// A snap's pick point moved onto its named face (an error when the face is gone: a joint must
-/// not quietly attach elsewhere).
-fn named_pick(doc: &Document, st: &ModelState, pick: Vec3, face: Option<&str>) -> Result<Vec3> {
+/// A snap's pick point moved onto its named face of `component` (an error when the face is gone:
+/// a joint must not quietly attach elsewhere).
+fn named_pick(doc: &Document, st: &ModelState, component: u64, pick: Vec3, face: Option<&str>) -> Result<Vec3> {
     match face {
-        Some(n) => face::named_face(doc, st, pick, n).map(|f| f.point),
+        Some(n) => face::named_face(doc, st, component, pick, n).map(|f| f.point),
         None => Ok(pick),
     }
 }
 
-/// The centre and outward normal of the planar face nearest `pick` (component coordinates; a
-/// body moved in from another component placed by its offset, as a named face is).
+/// The centre (the middle of its outline, `face::outline_centre`) and outward normal of the
+/// planar face nearest `pick` (component coordinates; a body moved in from another component
+/// placed by its offset, as a named face is).
 fn nearest_plane(doc: &Document, st: &ModelState, o: &JointOrigin, pick: Vec3) -> Result<(Vec3, Vec3)> {
     let comp = component_of(doc, o.occurrence)?;
-    let mut best: Option<(f64, Vec3, Vec3)> = None;
+    let mut best: Option<(f64, &crate::ModelBody, solidcraft_kernel::FaceInfo, Vec3)> = None;
     for b in component_bodies(doc, st, comp) {
         let offset = doc.model_body_offset(b);
         for f in b.joint_faces()?.iter() {
-            let Some(n) = f.plane_normal else { continue };
+            let Some(own) = f.plane_normal else { continue };
             let (c, n) = match offset {
-                Some(m) => (apply_point(m, f.centroid), apply_vector(m, n)),
-                None => (f.centroid, n),
+                Some(m) => (apply_point(m, f.centroid), apply_vector(m, own)),
+                None => (f.centroid, own),
             };
             let d = (pick - c).dot(n).abs() + 1e-3 * (pick - c).len();
-            if best.as_ref().is_none_or(|(bd, _, _)| d < *bd) {
-                best = Some((d, c, n));
+            if best.as_ref().is_none_or(|(bd, ..)| d < *bd) {
+                best = Some((d, b, f.clone(), own));
             }
         }
     }
-    best.map(|(_, c, n)| (c, n)).ok_or_else(|| DocError::Invalid("joint origin: no planar face there".into()))
+    let (_, b, f, n) = best.ok_or_else(|| DocError::Invalid("joint origin: no planar face there".into()))?;
+    // The face's middle: its outline's on a face with holes.
+    let c = face::outline_centre(&b.mesh(), f.index, f.centroid, n).unwrap_or(f.centroid);
+    Ok(match doc.model_body_offset(b) {
+        Some(m) => (apply_point(m, c), apply_vector(m, n)),
+        None => (c, n),
+    })
 }
 
 /// Resolve a joint origin to a frame in its component's coordinates.
@@ -798,20 +805,21 @@ pub fn resolve_origin(doc: &Document, st: &ModelState, o: &JointOrigin) -> Resul
         Snap::FaceCenter { pick, face, x } => {
             // A named planar face gives its own centre and normal; another face (or none) the
             // planar face nearest the point.
+            let comp = component_of(doc, o.occurrence)?;
             let named = match face.as_deref() {
-                Some(n) => Some(face::named_face(doc, st, *pick, n)?),
+                Some(n) => Some(face::named_face(doc, st, comp, *pick, n)?),
                 None => None,
             };
             let (c, n) = match named.as_ref().map(face::NamedFace::plane).transpose()?.flatten() {
                 Some(cn) => cn,
                 None => nearest_plane(doc, st, o, named.as_ref().map_or(*pick, |f| f.point))?,
             };
-            frame(c, n, face::x_axis(doc, st, x.as_ref(), c)?).ok_or_else(bad)
+            frame(c, n, face::x_axis(doc, st, comp, x.as_ref(), c)?).ok_or_else(bad)
         }
         Snap::Edge { .. } => edge::edge_frame(doc, st, component_of(doc, o.occurrence)?, &o.snap),
         Snap::CircleCenter { x, .. } => {
             let r = round_of(doc, st, o)?;
-            frame(r.centre, r.z, face::x_axis(doc, st, x.as_ref(), r.centre)?).ok_or_else(bad)
+            frame(r.centre, r.z, face::x_axis(doc, st, component_of(doc, o.occurrence)?, x.as_ref(), r.centre)?).ok_or_else(bad)
         }
     }
 }
@@ -821,13 +829,13 @@ pub fn resolve_origin(doc: &Document, st: &ModelState, o: &JointOrigin) -> Resul
 /// it, as older builds found them. Any other snap is refused.
 fn round_of(doc: &Document, st: &ModelState, o: &JointOrigin) -> Result<face::Round> {
     let Snap::CircleCenter { pick, face, end, .. } = &o.snap else { return Err(DocError::Invalid("pick a round face".into())) };
+    let comp = component_of(doc, o.occurrence)?;
     if let Some(n) = face.as_deref()
-        && let Some(r) = face::named_round(doc, st, *pick, n, end.as_deref())?
+        && let Some(r) = face::named_round(doc, st, comp, *pick, n, end.as_deref())?
     {
         return Ok(r);
     }
-    let pick = named_pick(doc, st, *pick, face.as_deref())?;
-    let comp = component_of(doc, o.occurrence)?;
+    let pick = named_pick(doc, st, comp, *pick, face.as_deref())?;
     // A body moved in from another component: looked at in its own coordinates, its cylinder
     // placed by its offset (as a named face is).
     let cyl = component_bodies(doc, st, comp)

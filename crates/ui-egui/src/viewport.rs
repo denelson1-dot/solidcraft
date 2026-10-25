@@ -34,6 +34,10 @@ mod removed_later_tests;
 #[path = "viewport_plane_target_tests.rs"]
 mod plane_target_tests;
 
+#[cfg(test)]
+#[path = "viewport_refine_wait_tests.rs"]
+mod refine_wait_tests;
+
 #[path = "navigation_cube.rs"]
 mod navigation_cube;
 
@@ -76,6 +80,8 @@ pub struct ViewportState {
     pub(crate) lod: std::sync::Mutex<crate::display_lod::Lod>,
     /// The view and model the refinement was last chosen for.
     lod_view: u64,
+    /// Refinement waits for the camera to stop ([`REFINE_STILL_MS`]).
+    lod_rest: CameraRest,
     /// Each body mesh's box (the mesh held, so its address stays its own), from the last state.
     mesh_bounds: std::sync::Mutex<MeshBounds>,
     /// Each shown body mesh's section index for the cut's normal (the mesh held, so its address
@@ -300,11 +306,16 @@ fn rgba(c: Rgb) -> [u8; 4] {
     [c.0, c.1, c.2, 255]
 }
 
-pub fn scene_radius(app: &SolveApp) -> f64 {
+fn scene_bounds(app: &SolveApp) -> solidcraft_engine::geom::Aabb3 {
     let mut b = model_bounds(app);
     if !app.preview.bounds.is_empty() {
         b = b.union(&app.preview.bounds);
     }
+    b
+}
+
+pub fn scene_radius(app: &SolveApp) -> f64 {
+    let b = scene_bounds(app);
     let r = if b.is_empty() { 50.0 } else { b.diagonal() * 0.5 + b.center().dist(app.cam.target) };
     r.max(app.cam.half_height() * 2.0).max(10.0)
 }
@@ -313,7 +324,7 @@ pub fn projection(app: &SolveApp, rect: Rect) -> Proj {
     let mut cam = app.cam;
     cam.fov = if app.perspective_view() { 0.6 } else { 0.0 };
     let aspect = rect.width() as f64 / rect.height().max(1.0) as f64;
-    Proj { cam, vp: cam.view_proj(aspect, scene_radius(app)), rect }
+    Proj { cam, vp: cam.view_proj_bounds(aspect, &scene_bounds(app)), rect }
 }
 
 /// Sketches drawn in the viewport: the active one, and finished ones not yet used by a feature.
@@ -550,6 +561,27 @@ fn drawn_mesh(app: &SolveApp, b: &solidcraft_engine::doc::ModelBody) -> std::syn
     if current() == DisplayQuality::Normal { b.mesh() } else { b.plan_mesh().unwrap_or_else(|| b.mesh()) }
 }
 
+/// How long (ms) the camera must stand still before display refinements are chosen and swapped in.
+const REFINE_STILL_MS: f64 = 200.0;
+
+/// The camera the last frame had and when it last differed from the one before (ms).
+#[derive(Default)]
+struct CameraRest {
+    camera: u64,
+    moved_at: f64,
+}
+
+impl CameraRest {
+    /// Notes this frame's camera (a hash of the view) at `now` (ms); how much longer (ms) the
+    /// camera has to stand still, 0 once it has for [`REFINE_STILL_MS`].
+    fn wait(&mut self, camera: u64, now: f64) -> f64 {
+        if camera != self.camera {
+            *self = CameraRest { camera, moved_at: now };
+        }
+        (REFINE_STILL_MS - (now - self.moved_at)).max(0.0)
+    }
+}
+
 /// Choose which bodies to draw finer than the chosen display quality for this view (#1320):
 /// each shown body's screen-space error from its box on screen, refinements planned off the UI
 /// thread and swapped in when ready. Keeps repainting while refinements are being planned.
@@ -563,6 +595,15 @@ fn update_refinement(app: &mut SolveApp, ctx: &egui::Context, proj: &Proj) {
     scene_key(app).hash(&mut h);
     crate::sketch_display::projection_key(proj, app.viewport.pixels_per_point()).hash(&mut h);
     let view = h.finish();
+    // A moving camera is left alone: every refinement swapped in rebuilds and uploads the whole
+    // model scene, which in a large assembly takes tens of milliseconds a time. The bodies keep
+    // the step they have until the camera has stood still for [`REFINE_STILL_MS`].
+    let camera = crate::sketch_display::projection_key(proj, app.viewport.pixels_per_point());
+    let wait = app.viewport.lod_rest.wait(camera, crate::now_ms());
+    if wait > 0.0 {
+        ctx.request_repaint_after(std::time::Duration::from_millis(wait as u64 + 5));
+        return;
+    }
     // While refinements are being planned, the view standing still: only collect finished ones.
     if view == app.viewport.lod_view {
         let (busy, finished) = app.viewport.lod.lock().map_or((false, false), |mut l| {
@@ -8626,6 +8667,54 @@ mod grid_plane_tests {
         }
         app.ui.show_grid = true;
         assert!(!grid(&app).is_empty());
+    }
+
+    #[test]
+    fn imported_scene_projection_toggle_keeps_front_components_in_clip_range() {
+        use solidcraft_engine::doc::{Document, FeatureKind, MeshData};
+        let mut doc = Document::default();
+        let meshes = [-10_000.0, 10_000.0]
+            .into_iter()
+            .enumerate()
+            .map(|(i, y)| MeshData {
+                name: format!("Panel {i}"),
+                positions: vec![-0.25, y, -0.25, 0.25, y, -0.25, 0.0, y, 0.25].into(),
+                triangles: vec![0, 1, 2].into(),
+                color: None,
+            })
+            .collect();
+        doc.add_feature(FeatureKind::MeshImport { file: "synthetic.stl".into(), meshes }, Some("Panels")).unwrap();
+        let mut app = SolveApp::new(solidcraft_engine::Session::new(doc), crate::Services::default());
+        app.cam.yaw = 0.0;
+        app.cam.pitch = 0.0;
+        app.fit_view();
+        app.cancel_view_animation();
+        app.cam.distance = 10_002.0;
+        assert_eq!(app.session.world_state().bodies.len(), 2);
+        let camera = app.cam;
+        let rect = Rect::from_min_size(Pos2::ZERO, vec2(1280.0, 720.0));
+        let original = projection(&app, rect).vp;
+        for shadow in [false, true] {
+            app.ui.ground_shadow = shadow;
+            for perspective in [false, true, false] {
+                app.ui.perspective = perspective;
+                let proj = projection(&app, rect);
+                for body in &app.session.world_state().bodies {
+                    let (mesh, _) = body.mesh_in_place();
+                    assert_eq!(mesh.positions.len(), 3);
+                    for p in &mesh.positions {
+                        let c = proj.vp.apply(*p);
+                        assert!(c.iter().all(|v| v.is_finite()));
+                        assert!(c[3] > 0.0 && (0.0..=c[3]).contains(&c[2]), "shadow={shadow}, perspective={perspective}, {p:?}: {c:?}");
+                        assert!(c[0].abs() <= c[3] && c[1].abs() <= c[3]);
+                    }
+                }
+                assert_eq!(app.cam, camera, "changing projection preserves the orbit camera");
+                if !perspective {
+                    assert_eq!(proj.vp, original);
+                }
+            }
+        }
     }
 
     /// A sketch is drawn in a parallel view even when the preference asks for perspective; the

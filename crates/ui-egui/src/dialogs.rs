@@ -405,6 +405,9 @@ pub struct HoleOpts {
     pub custom_thread: Option<crate::dialogs_thread::HoleThreadDraft>,
     /// The Single hole's reference edge distances (`hole_refs`, #37).
     pub refs: Box<crate::hole_refs::Refs>,
+    /// Use the full useful cylindrical wall, independently of the drill extents.
+    pub thread_full_depth: bool,
+    pub thread_depth: String,
 }
 
 impl Default for HoleOpts {
@@ -418,6 +421,8 @@ impl Default for HoleOpts {
             thread: "M5".into(),
             custom_thread: None,
             refs: Default::default(),
+            thread_full_depth: true,
+            thread_depth: "10 mm".into(),
         }
     }
 }
@@ -2414,6 +2419,15 @@ fn auto_operation(app: &SolveApp, d: &mut Dialog) {
         return;
     }
     let Some(params) = dialog_commands(app, d).ok().and_then(|c| c.into_iter().next()).map(|(_, p)| p) else { return };
+    // A new start (From Object, a start offset) puts the extrude somewhere else: the latch was
+    // decided for the old one (#467).
+    let start = json!([params.get("from"), params.get("start_offset")]);
+    if let Kind::Extrude { smart, .. } = &mut d.kind
+        && smart.start != start
+    {
+        smart.start = start;
+        smart.latch = None;
+    }
     // To an object, the extrude goes to it on whichever side it is: that is the side (#1633).
     if params.get("to").is_some()
         && let Some(reach) = solidcraft_engine::extrude_reach(&app.session, &params)
@@ -2449,9 +2463,6 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
         app.viewport.dialog_rect = None;
     }
     let Some(mut d) = app.dialog.take() else {
-        if app.tree.redefine.is_none() && app.params.is_none() {
-            crate::frame::reset_dock_offset(ctx);
-        }
         return;
     };
     // Edit Text lasts as long as its text: other design changes leave it open.
@@ -2503,9 +2514,10 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
         app.dialog = Some(d);
         return;
     }
-    // Dragged by its title band, the dialog keeps that offset from its docked place while it
-    // is open (#1335), kept inside the viewport.
-    let moved = crate::frame::dock_offset(ctx, title(&d.kind));
+    // Command dialogs share the last dragged offset on this side until the application
+    // exits, kept inside the viewport.
+    let drag_key = side.dialog_offset_key();
+    let moved = crate::frame::dock_offset(ctx, drag_key);
     let docked = egui::pos2(side.anchor_x(vp), top);
     let drag_bounds = crate::shell::tool_drag_rect(app, vp);
     let anchor = crate::frame::offset_anchor(docked, moved, drag_bounds, side);
@@ -2587,14 +2599,7 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
             let icon = spec.as_ref().map_or("", |s| s.icon);
             let label = spec.as_ref().map_or(heading.as_str(), |s| tr(s.label));
             let label = if d.editing.is_some() { heading.as_str() } else { label };
-            let heading = crate::ui_kit::FeatureOptions {
-                icon,
-                title: label,
-                drag_key: title(&d.kind),
-                moved,
-                docked,
-                apply_label: repeatable.then_some("Apply"),
-            };
+            let heading = crate::ui_kit::FeatureOptions { icon, title: label, drag_key, moved, docked, apply_label: repeatable.then_some("Apply") };
             let applying = app.applying.is_some();
             let mut collapsed = d.collapsed;
             let manager = matches!(
@@ -3946,7 +3951,7 @@ fn dialog_commands(app: &SolveApp, d: &Dialog) -> Result<Vec<(String, Value)>, S
                 } else if !opts.all {
                     params["depth"] = json!(depth);
                 }
-                if ty == "drilled" {
+                if ty == "drilled" || (opts.angled && !opts.all) {
                     params["tip_angle"] = json!(opts.tip_angle);
                 }
                 if opts.tapped {
@@ -3956,6 +3961,9 @@ fn dialog_commands(app: &SolveApp, d: &Dialog) -> Result<Vec<(String, Value)>, S
                     solidcraft_engine::doc::parse_tapped_thread(&opts.thread)
                         .ok_or("select a valid metric or catalogued UNC/UNF, G or Rp thread size")?;
                     params["thread"] = json!(opts.thread.trim());
+                    if !opts.thread_full_depth {
+                        params["thread_depth"] = json!(opts.thread_depth.trim());
+                    }
                 }
                 match *kind {
                     1 => {
@@ -4715,7 +4723,7 @@ pub fn for_feature(app: &SolveApp, id: u64, marker: Option<usize>) -> Option<Dia
             d.extra.insert("pull".into(), pt3(pull.0));
             d
         }
-        FeatureKind::Hole { position, at, direction, diameter, depth, hole, points, thread, to, references } => {
+        FeatureKind::Hole { position, at, direction, diameter, depth, hole, points, thread, thread_depth, to, references } => {
             let mut d = start("solid.hole")?;
             let mut k = hole_defaults();
             if let Kind::Hole { diameter: dia, depth: dep, kind, cb_diameter, cb_depth, cs_diameter, cs_angle, opts } = &mut k {
@@ -4727,19 +4735,31 @@ pub fn for_feature(app: &SolveApp, id: u64, marker: Option<usize>) -> Option<Dia
                     opts.tapped = true;
                     opts.thread = th.clone();
                 }
+                opts.thread_full_depth = thread_depth.is_none();
+                if let Some(depth) = thread_depth {
+                    opts.thread_depth = depth.to_string();
+                }
                 if let Some(dd) = depth {
                     *dep = dd.to_string();
                 }
                 match hole {
-                    HoleKind::Counterbore { cb_diameter: a, cb_depth: b } => {
+                    HoleKind::Counterbore { cb_diameter: a, cb_depth: b, tip_angle } => {
                         *kind = 1;
                         *cb_diameter = a.to_string();
                         *cb_depth = b.to_string();
+                        if let Some(angle) = tip_angle {
+                            opts.angled = true;
+                            opts.tip_angle = angle.to_string();
+                        }
                     }
-                    HoleKind::Countersink { cs_diameter: a, cs_angle: b } => {
+                    HoleKind::Countersink { cs_diameter: a, cs_angle: b, tip_angle } => {
                         *kind = 2;
                         *cs_diameter = a.to_string();
                         *cs_angle = b.to_string();
+                        if let Some(angle) = tip_angle {
+                            opts.angled = true;
+                            opts.tip_angle = angle.to_string();
+                        }
                     }
                     HoleKind::Drilled { tip_angle } => {
                         opts.tip_angle = tip_angle.to_string();
@@ -5344,6 +5364,34 @@ mod refused_ok_tests {
 
     fn set_depth(h: &mut Harness, depth: &str) {
         steps(h, &[json!({"click": {"handle": "dialog:Depth"}}), json!({"key": "A", "cmd": true}), json!({"text": depth})]);
+    }
+
+    #[test]
+    fn recessed_drill_point_controls_and_payload_follow_the_bottom_choice() {
+        for recessed in [1, 2] {
+            let mut h = hole_dialog();
+            if let Kind::Hole { kind, opts, .. } = &mut h.app.dialog.as_mut().unwrap().kind {
+                *kind = recessed;
+                opts.angled = true;
+                opts.tip_angle = "118 deg".into();
+            }
+            h.frames(2);
+            assert!(crate::scenario::rect_of("dialog:widget:Drill Point").is_some());
+            assert!(crate::scenario::rect_of("dialog:widget:Tip Angle").is_some());
+            let commands = apply_commands(&h.app, h.app.dialog.as_ref().unwrap()).unwrap();
+            assert_eq!(commands[0].1["tip_angle"], "118 deg");
+            if let Kind::Hole { opts, .. } = &mut h.app.dialog.as_mut().unwrap().kind {
+                opts.angled = false;
+            }
+            h.frames(2);
+            assert!(crate::scenario::rect_of("dialog:widget:Tip Angle").is_none());
+            assert!(apply_commands(&h.app, h.app.dialog.as_ref().unwrap()).unwrap()[0].1.get("tip_angle").is_none());
+            if let Kind::Hole { opts, .. } = &mut h.app.dialog.as_mut().unwrap().kind {
+                opts.all = true;
+            }
+            h.frames(2);
+            assert!(crate::scenario::rect_of("dialog:widget:Drill Point").is_none());
+        }
     }
 
     /// What the dialog shows in red once the live preview has finished: its own error, else the
