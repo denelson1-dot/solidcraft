@@ -61,6 +61,9 @@ pub struct ViewportState {
     /// Per-body boxes of one world state, held (not just its address, which a later state can
     /// reuse once the old one is freed, so stale boxes would come back).
     pick_bounds: std::sync::Mutex<Option<BodyBounds>>,
+    /// The sketches' box in the world of one world state (held, as `pick_bounds` is). Every
+    /// `projection` reads it, several times a frame, and each sketch's box samples its curves.
+    sketch_bounds: std::sync::Mutex<Option<(std::sync::Arc<solidcraft_engine::doc::ModelState>, solidcraft_engine::geom::Aabb3)>>,
     /// The model scene's blocks of bodies by key, from the last scene built.
     pub(crate) blocks: std::sync::Mutex<std::collections::HashMap<u64, CachedBlock>>,
     /// The triangles of each mesh the last scene drew as instances, by the mesh's address (the
@@ -90,8 +93,12 @@ pub struct ViewportState {
     pub(crate) palette_rect: Option<Rect>,
     pub(crate) dialog_rect: Option<Rect>,
     pub gpu: Option<GpuTarget>,
+    /// What the GPU drew last frame, shared with the renderer (the frame-rate details, #2548).
+    pub(crate) draw_stats: Option<crate::gpu::DrawStatsHandle>,
+    /// The graphics backend and adapter, as the frame-rate details show them.
+    pub(crate) adapter: String,
     slot: SceneSlot,
-    key: u64,
+    pub(crate) key: u64,
     sketch_slot: SceneSlot,
     sketch_key: u64,
     physical_scale: f32,
@@ -156,6 +163,8 @@ pub struct ViewportState {
     pub(crate) joint_drag: Option<crate::joint_drag::Drag>,
     /// A free part being dragged to a new place (#2804).
     pub(crate) occurrence_drag: Option<crate::occurrence_drag::Drag>,
+    /// Extrude by pulling a face or profile.
+    pub(crate) drag_extrude: crate::drag_extrude::State,
     /// The plane the grid was last drawn on while Preferences ▸ Grid follows the view is on
     /// (#1470), kept so the choice is hysteretic near the thresholds (#1993).
     pub(crate) grid_plane: std::sync::Mutex<GridPlane>,
@@ -431,7 +440,7 @@ fn sketch_color(t: &Tokens, c: Rgb) -> [u8; 4] {
 }
 
 /// With a component active, bodies outside it are drawn faded.
-fn body_faded(app: &SolveApp, b: &solidcraft_engine::doc::ModelBody, active_bodies: &Option<Vec<String>>) -> bool {
+pub(crate) fn body_faded(app: &SolveApp, b: &solidcraft_engine::doc::ModelBody, active_bodies: &Option<Vec<String>>) -> bool {
     let s = &app.session;
     if let Some(names) = active_bodies {
         !names.contains(&b.name)
@@ -1305,7 +1314,7 @@ pub fn construction_quads(app: &SolveApp) -> Vec<(String, Vec3, [Vec3; 4])> {
 /// Pick what is under `pos`: sketch points, sketch curves, vertices, edges and axes first, then
 /// the surfaces along the ray (profiles, faces, planes) nearest first.
 /// Bounding boxes of the shown model's bodies (cached until the model changes).
-fn body_bounds(
+pub(crate) fn body_bounds(
     app: &SolveApp,
     st: &std::sync::Arc<solidcraft_engine::doc::ModelState>,
 ) -> std::sync::Arc<Vec<(String, solidcraft_engine::geom::Aabb3)>> {
@@ -1352,7 +1361,24 @@ type BodyBounds = (std::sync::Arc<solidcraft_engine::doc::ModelState>, std::sync
 /// The model's extent: bodies (from the cached boxes) and sketches.
 pub fn model_bounds(app: &SolveApp) -> solidcraft_engine::geom::Aabb3 {
     let st = crate::open_meshing::shown_world(app);
-    let mut b = body_bounds(app, &st).iter().fold(solidcraft_engine::geom::Aabb3::EMPTY, |a, (_, x)| a.union(x));
+    let bodies = body_bounds(app, &st).iter().fold(solidcraft_engine::geom::Aabb3::EMPTY, |a, (_, x)| a.union(x));
+    let mut b = bodies.union(&sketch_bounds(app, &st));
+    for point in crate::sketch_attachment_ui::guide_lines(app).into_iter().flatten() {
+        b.add(point);
+    }
+    b
+}
+
+/// The box of every sketch of `st` in the world, kept for that state: a design with hundreds of
+/// sketches spent most of each frame sampling their splines again for `projection`.
+fn sketch_bounds(app: &SolveApp, st: &std::sync::Arc<solidcraft_engine::doc::ModelState>) -> solidcraft_engine::geom::Aabb3 {
+    if let Ok(g) = app.viewport.sketch_bounds.lock()
+        && let Some((k, b)) = g.as_ref()
+        && std::sync::Arc::ptr_eq(k, st)
+    {
+        return *b;
+    }
+    let mut b = solidcraft_engine::geom::Aabb3::EMPTY;
     for ss in &st.sketches {
         if let Some((lo, hi)) = ss.sketch.bounds() {
             for p in [lo, hi] {
@@ -1360,14 +1386,14 @@ pub fn model_bounds(app: &SolveApp) -> solidcraft_engine::geom::Aabb3 {
             }
         }
     }
-    for point in crate::sketch_attachment_ui::guide_lines(app).into_iter().flatten() {
-        b.add(point);
+    if let Ok(mut g) = app.viewport.sketch_bounds.lock() {
+        *g = Some((std::sync::Arc::clone(st), b));
     }
     b
 }
 
 /// Where a ray enters a box (None: it misses).
-fn ray_box(o: Vec3, d: Vec3, b: &solidcraft_engine::geom::Aabb3, pad: f64) -> Option<f64> {
+pub(crate) fn ray_box(o: Vec3, d: Vec3, b: &solidcraft_engine::geom::Aabb3, pad: f64) -> Option<f64> {
     let (mut t0, mut t1) = (f64::NEG_INFINITY, f64::INFINITY);
     for (oo, dd, lo, hi) in [(o.x, d.x, b.min.x, b.max.x), (o.y, d.y, b.min.y, b.max.y), (o.z, d.z, b.min.z, b.max.z)] {
         let (lo, hi) = (lo - pad, hi + pad);
@@ -1385,7 +1411,7 @@ fn ray_box(o: Vec3, d: Vec3, b: &solidcraft_engine::geom::Aabb3, pad: f64) -> Op
 }
 
 /// The point of segment `a`–`b` nearest the ray from `o` along `d`.
-fn ray_segment_closest(o: Vec3, d: Vec3, a: Vec3, b: Vec3) -> Vec3 {
+pub(crate) fn ray_segment_closest(o: Vec3, d: Vec3, a: Vec3, b: Vec3) -> Vec3 {
     let u = b - a;
     let w = a - o;
     let (dd, du, uu) = (d.dot(d), d.dot(u), u.dot(u));
@@ -1402,7 +1428,7 @@ fn ray_segment_closest(o: Vec3, d: Vec3, a: Vec3, b: Vec3) -> Vec3 {
 }
 
 /// A box's outline on screen, grown by `px` (None: behind the eye).
-fn screen_box(proj: &Proj, b: &solidcraft_engine::geom::Aabb3, px: f32) -> Option<Rect> {
+pub(crate) fn screen_box(proj: &Proj, b: &solidcraft_engine::geom::Aabb3, px: f32) -> Option<Rect> {
     let mut r = Rect::NOTHING;
     for i in 0..8 {
         let p = Vec3::new(
@@ -2861,7 +2887,7 @@ fn body_rgb(app: &SolveApp, name: &str) -> (u8, u8, u8) {
 
 /// The ray `o` + t `d` in the frame of a mesh that `place` (a rigid move) puts in the world, with
 /// the same t along it; `None` for a move with no inverse.
-fn local_ray(place: &solidcraft_engine::doc::Mat, o: Vec3, d: Vec3) -> Option<(Vec3, Vec3)> {
+pub(crate) fn local_ray(place: &solidcraft_engine::doc::Mat, o: Vec3, d: Vec3) -> Option<(Vec3, Vec3)> {
     if solidcraft_engine::doc::is_identity(place) {
         return Some((o, d));
     }
@@ -2882,7 +2908,7 @@ pub(crate) fn polyline_mid(pts: &[Vec3]) -> Vec3 {
     pts.first().copied().unwrap_or_default()
 }
 
-fn seg_dist(p: Pos2, a: Pos2, b: Pos2) -> f32 {
+pub(crate) fn seg_dist(p: Pos2, a: Pos2, b: Pos2) -> f32 {
     let ab = b - a;
     let l2 = ab.length_sq();
     let t = if l2 > 0.0 { ((p - a).dot(ab) / l2).clamp(0.0, 1.0) } else { 0.0 };
@@ -3123,7 +3149,7 @@ pub fn show(app: &mut SolveApp, ui: &mut egui::Ui) {
     }
     let overlay_rect = crate::shell::bottom_overlay_rect(app, rect);
     analysis_legend(app, &painter, overlay_rect);
-    crate::frame_rate::paint(app, ui.ctx(), &painter, overlay_rect);
+    crate::frame_rate::paint(app, ui, &painter, overlay_rect);
 
     // ---- interaction ----
     // A tool's click that moved on the way (#2448) clicks where the button is let go.
@@ -3513,8 +3539,9 @@ pub fn show(app: &mut SolveApp, ui: &mut egui::Ui) {
             && !crate::shell::covered(app, a)
             && !axes.contains(a)
             && !crate::occurrence_drag::start(app, &proj, a)
+            && !crate::joint_drag::start(app, &proj, a)
         {
-            crate::joint_drag::start(app, &proj, a);
+            crate::drag_extrude::press(app, &proj, a);
         }
         if resp.dragged_by(egui::PointerButton::Primary)
             && let Some(p) = hover
@@ -3534,6 +3561,15 @@ pub fn show(app: &mut SolveApp, ui: &mut egui::Ui) {
     if crate::occurrence_drag::active(app) && (resp.drag_stopped() || !ui.input(|i| i.pointer.primary_down())) {
         crate::occurrence_drag::end(app);
     }
+    // Pulling a face or profile extrudes it; the release applies.
+    if resp.dragged_by(egui::PointerButton::Primary)
+        && let Some(p) = hover
+    {
+        crate::drag_extrude::to(app, &proj, p);
+    }
+    if resp.drag_stopped() || !primary_down {
+        crate::drag_extrude::end(app);
+    }
     // Box selection: a primary drag on the model when no navigation mode is on.
     if app.tool.is_none()
         && !held
@@ -3542,6 +3578,7 @@ pub fn show(app: &mut SolveApp, ui: &mut egui::Ui) {
         && app.viewport.point_drag.is_none()
         && !crate::joint_drag::active(app)
         && !crate::occurrence_drag::active(app)
+        && !crate::drag_extrude::started(app)
         && !crate::dim_view::dragging()
         && !crate::sketch3d::dragging()
         && !crate::sketch_text_handles::dragging(app)
@@ -3579,6 +3616,8 @@ pub fn show(app: &mut SolveApp, ui: &mut egui::Ui) {
     crate::inference::show(app, &painter, &proj);
     crate::drag_snap::show(app, &painter, &proj);
     hover_highlight(app, &painter, &proj);
+    crate::drag_extrude::tick(app);
+    crate::drag_extrude::show(app, &painter);
     points_2d(app, &painter, &proj);
     if let Some((plane, sketch)) = crate::sketch_attachment_ui::lost_guide(app)
         && let Some((low, high)) = sketch.bounds()

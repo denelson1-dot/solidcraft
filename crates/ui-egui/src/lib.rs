@@ -52,6 +52,7 @@ pub mod dim_view;
 #[cfg(test)]
 mod dimension_create_ui_tests;
 pub mod documents;
+pub mod drag_extrude;
 pub mod drag_snap;
 pub mod edit_clipboard;
 #[cfg(test)]
@@ -257,6 +258,7 @@ pub mod ui_kit;
 #[cfg(test)]
 mod ui_kit_guard_tests;
 pub mod update;
+pub mod view_pick;
 pub mod viewport;
 mod viewport_layout;
 pub mod workspace;
@@ -675,7 +677,9 @@ impl SolveApp {
     }
 
     fn set_wgpu_targets(&mut self, rs: &egui_wgpu::RenderState, scene: crate::gpu::GpuTarget, window: crate::gpu::GpuTarget) {
-        self.viewport.gpu = Some(gpu::install(rs, scene, window, !self.cpu_meshing));
+        let (target, stats) = gpu::install(rs, scene, window, !self.cpu_meshing);
+        self.viewport.gpu = Some(target);
+        self.viewport.draw_stats = Some(stats);
         render_workspace::invalidate_scene(self);
         let (samples, has_depth) = self.viewport.gpu.map_or((1, false), |g| (g.samples.max(1), g.depth.is_some()));
         self.render_workspace.host = match render_workspace::host_executor(rs.device.limits().max_texture_dimension_2d, has_depth, samples) {
@@ -695,6 +699,7 @@ impl SolveApp {
         self.msaa_supported = rs.msaa_supported.clone();
         let info = rs.adapter.get_info();
         self.help.gpu = Some(format!("{} ({:?}, {:?})", info.name.trim(), info.backend, info.device_type));
+        self.viewport.adapter = format!("{:?} · {}", info.backend, info.name);
     }
 
     /// Preferences kept between runs (JSON), for the host to store.
@@ -1189,11 +1194,8 @@ impl SolveApp {
             self.edit_sketch(id);
             return;
         }
-        if self.session.active_sketch.is_some() {
-            self.finish_sketch();
-        }
         let Some(idx) = self.session.doc.feature_index(id) else { return };
-        let marker = self.session.doc.marker;
+        let marker = self.finish_sketch_for_edit();
         self.tool = None;
         if dialogs::roll_marker(self, Some(idx)).is_err() {
             return;
@@ -1224,22 +1226,29 @@ impl SolveApp {
         if self.session.active_sketch == Some(id) {
             return;
         }
-        if self.session.active_sketch.is_some() {
-            self.finish_sketch();
-        }
+        let Some(idx) = self.session.doc.feature_index(id) else { return };
+        let marker = self.finish_sketch_for_edit();
         self.tool = None;
         self.dialog = None;
-        let Some(idx) = self.session.doc.feature_index(id) else { return };
-        let marker = self.session.doc.marker;
-        let rolled = marker != Some(idx + 1) && self.run("timeline.roll_to", json!({ "position": idx + 1 })).is_ok();
+        let rolled = self.session.doc.marker != Some(idx + 1) && self.run("timeline.roll_to", json!({ "position": idx + 1 })).is_ok();
         if self.run("sketch.edit", json!({ "sketch": id })).is_err() {
-            if rolled {
+            if rolled || marker != self.session.doc.marker {
                 self.restore_marker(marker);
             }
             return;
         }
-        self.pre_sketch_marker = rolled.then_some(marker);
+        self.pre_sketch_marker = (rolled || marker != self.session.doc.marker).then_some(marker);
         dialogs::look_at_sketch(self);
+    }
+
+    /// Pass the original marker to the next editor. Restoring it between editors could finish
+    /// in the background after the next rollback, moving the marker out from under that edit.
+    fn finish_sketch_for_edit(&mut self) -> Option<usize> {
+        let marker = self.pre_sketch_marker.take().unwrap_or(self.session.doc.marker);
+        if self.session.active_sketch.is_some() {
+            self.finish_sketch();
+        }
+        marker
     }
 
     /// Finish the active sketch: stop editing and restore the history marker Edit Sketch moved.
