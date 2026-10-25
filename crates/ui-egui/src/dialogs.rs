@@ -105,7 +105,8 @@ crate::dialog_descriptor::dialog_descriptors! {
             FeatureKind::Draft { angle, .. }) {
             angle: String = "5 deg".into() => angle.to_string(),
         } => json!({"angle": angle});
-        OffsetPlane("construct.plane.offset", "OFFSET PLANE", [("Plane", PLANES | PLANAR_FACES, false)],
+        // A point picked as well puts the plane through it instead of at the distance.
+        OffsetPlane("construct.plane.offset", "OFFSET PLANE", [("Plane", PLANES | PLANAR_FACES, false), ("Through point", selection::VERTICES | selection::POINTS, false)],
             FeatureKind::ConstructionPlane { plane: PlaneRef::Offset { distance, .. } }) {
             offset: String = "0 mm".into() => distance.to_string(),
         } => json!({"offset": offset});
@@ -695,7 +696,7 @@ impl Dialog {
             ),
             "solid.revolve" => Dialog::new(
                 Kind::Revolve { angle: "360 deg".into(), operation: 0, axis: None },
-                vec![SelInput::new("Profile", PROFILES, true), SelInput::new("Axis", AXES, false)],
+                vec![SelInput::new("Profile", PROFILES | PLANAR_FACES, true), SelInput::new("Axis", AXES, false)],
             ),
             "solid.fillet" => Dialog::new(fillet_kind("2 mm", false), vec![SelInput::new("Edges", EDGES | FACES, true)]),
             "solid.chamfer" => Dialog::new(fillet_kind("1 mm", true), vec![SelInput::new("Edges", EDGES | FACES, true)]),
@@ -1048,6 +1049,7 @@ impl Dialog {
     /// The main value (shown on the canvas too): label, kind and the expression.
     pub fn primary(&mut self) -> Option<(&'static str, ValueKind, &mut String)> {
         let move_field = crate::dialogs_move::value_field(self);
+        let through_point = offset_through_point(self).is_some();
         Some(match &mut self.kind {
             Kind::Extrude { to_offset, .. } if to_object_on(&self.inputs) => ("To Offset", ValueKind::Length, to_offset),
             Kind::Extrude { distance, .. } => ("Distance", ValueKind::Length, distance),
@@ -1088,6 +1090,7 @@ impl Dialog {
             Kind::PatternRect { spacing, .. } => ("Spacing", ValueKind::Length, spacing),
             Kind::PatternCirc { angle, .. } => ("Angle", ValueKind::Angle, angle),
             Kind::Section { offset, .. } => ("Distance", ValueKind::Length, offset),
+            Kind::OffsetPlane { .. } if through_point => return None,
             Kind::OffsetPlane { offset } => ("Distance", ValueKind::Length, offset),
             Kind::PathPlane { t, .. } => ("Position (0 to 1)", ValueKind::Unitless, t),
             Kind::Rib { thickness, .. } => ("Thickness", ValueKind::Length, thickness),
@@ -2044,6 +2047,7 @@ fn selection_label(s: &Session, item: &Sel) -> String {
             let p = s.active_sketch.and_then(|id| state.sketch(id)).map(|sk| sk.plane.to_local(*point)).unwrap_or_default();
             format!("({:.2}, {:.2}) mm", p.x, p.y)
         }
+        Sel::Vertex { body, .. } => format!("{body} · vertex"),
         _ => format!("{item:?}"),
     }
 }
@@ -2455,10 +2459,21 @@ fn picked_side(app: &SolveApp, d: &Dialog, first: &Sel) -> Option<usize> {
     Some(crate::smart_extrude::picked_direction(crate::smart_extrude::view_ray(&app.cam, at), normal, false))
 }
 
+/// Show the sketch of the Extrude or Revolve the open dialog edits, and only while it is open:
+/// whichever way the dialog closed (OK, Cancel, another tool, another design), the sketch
+/// returns to its own visibility.
+pub(crate) fn sync_feature_edit_sketch(app: &mut SolveApp) {
+    app.session.feature_edit_sketch = app.dialog.as_ref().and_then(|d| d.editing).and_then(|(id, _)| match &app.session.doc.feature(id)?.kind {
+        FeatureKind::Extrude { sketch, .. } | FeatureKind::Revolve { sketch, .. } => Some(**sketch),
+        _ => None,
+    });
+}
+
 /// Show the active dialog (if any), docked flush to an edge of the viewport just below the axis
 /// view, sized to its content. The right edge is its place, except while a sketch is open: the
 /// Sketch Palette keeps the right there, and the dialog takes the left so both stay on screen.
 pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
+    sync_feature_edit_sketch(app);
     if app.tree.redefine.is_none() {
         app.viewport.dialog_rect = None;
     }
@@ -2770,6 +2785,7 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
         app.applying = None;
     }
     if !keep || cancel {
+        app.session.feature_edit_sketch = None;
         crate::dialogs_motion::closed(app, &mut d, applied);
         if let Kind::Text(k) = &mut d.kind {
             crate::sketch_text::closed(app, k, applied);
@@ -2799,6 +2815,7 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
 
 /// Close the dialog without applying it (Esc, Cancel). An edit puts the timeline marker back.
 pub fn cancel(app: &mut SolveApp) {
+    app.session.feature_edit_sketch = None;
     app.applying = None;
     if let Some(mut d) = app.dialog.take() {
         crate::dialogs_motion::closed(app, &mut d, false);
@@ -3478,8 +3495,22 @@ fn dialog_commands(app: &SolveApp, d: &Dialog) -> Result<Vec<(String, Value)>, S
                 _ => stored_axis.clone().ok_or("select an axis")?,
             };
             let (sketch, idx) = profiles();
-            let mut p =
-                json!({"sketch": sketch, "profiles": idx, "axis": axis, "angle": angle, "operation": OPS.get(*operation).copied().unwrap_or("new")});
+            let mut p = json!({"axis": axis, "angle": angle, "operation": OPS.get(*operation).copied().unwrap_or("new")});
+            // A planar body face revolves like a profile (#2747); profiles win when both are picked.
+            let face = sels(d, 0).iter().find_map(|x| match x {
+                Sel::Face { body, point, .. } => Some((body, point)),
+                _ => None,
+            });
+            match face {
+                Some((body, point)) if sketch.is_null() => {
+                    p["face"] = pt(*point);
+                    p["face_body"] = json!(body);
+                }
+                _ => {
+                    p["sketch"] = sketch;
+                    p["profiles"] = idx;
+                }
+            }
             if to_object_on(&d.inputs) {
                 p["to"] = to_object_point(&d.inputs).ok_or("select the object to turn to")?;
             }
@@ -3648,7 +3679,11 @@ fn dialog_commands(app: &SolveApp, d: &Dialog) -> Result<Vec<(String, Value)>, S
         Kind::OffsetPlane { .. } => {
             need(0, "a plane")?;
             let base = plane_arg(app, sels(d, 0).first())?;
-            ("construct.plane.offset", json!({"base": base}))
+            match offset_through_point(d) {
+                // A null `offset` keeps the descriptor's distance out: the plane goes through the point.
+                Some(point) => ("construct.plane.offset", json!({"base": base, "through": construct_ref(app, point)?, "offset": null})),
+                None => ("construct.plane.offset", json!({"base": base})),
+            }
         }
         Kind::MeshConvert { tolerance } => {
             need(0, "the mesh body")?;
@@ -4454,6 +4489,27 @@ fn plane_arg(app: &SolveApp, sel: Option<&Sel>) -> Result<Value, String> {
     }
 }
 
+/// The point an Offset Plane dialog puts its plane through, when one is picked.
+pub(crate) fn offset_through_point(d: &Dialog) -> Option<&Sel> {
+    if !matches!(d.kind, Kind::OffsetPlane { .. }) {
+        return None;
+    }
+    sels(d, 1).first()
+}
+
+/// A stored point reference back into a dialog pick: a body vertex or a sketch point.
+fn point_sel(s: &Session, g: &solidcraft_engine::doc::construct::GeoRef) -> Option<Sel> {
+    use solidcraft_engine::doc::construct::GeoRef;
+    match g {
+        GeoRef::Vertex { at, .. } => match face_sel(s, *at)? {
+            Sel::Face { body, .. } => Some(Sel::Vertex { body, point: *at }),
+            _ => None,
+        },
+        GeoRef::SketchPoint { sketch, point } => Some(Sel::SketchPoint { id: format!("{sketch}:{point}") }),
+        _ => None,
+    }
+}
+
 /// A stored construction reference back into a dialog pick.
 fn geo_sel(s: &Session, g: &solidcraft_engine::doc::construct::GeoRef) -> Option<Sel> {
     match g {
@@ -5094,6 +5150,16 @@ pub fn for_feature(app: &SolveApp, id: u64, marker: Option<usize>) -> Option<Dia
             }
             d
         }
+        FeatureKind::ConstructionPlane { plane: PlaneRef::ThroughPoint { base, point } } => {
+            let mut d = start("construct.plane.offset")?;
+            if let Some(inp) = d.inputs.first_mut() {
+                inp.items = plane_sel(s, base).into_iter().collect();
+            }
+            if let Some(inp) = d.inputs.get_mut(1) {
+                inp.items = point_sel(s, point).into_iter().collect();
+            }
+            d
+        }
         FeatureKind::ConstructionPlane { plane: PlaneRef::AlongPath { path, t } } => {
             let mut d = start("construct.plane.along_path")?;
             let (item, sketch) = match path.as_ref() {
@@ -5360,6 +5426,55 @@ mod refused_ok_tests {
             ],
         );
         h
+    }
+
+    /// A sketch, a second sketch after it, and `command` made from the first; the edit dialog
+    /// of that feature open, so the history marker sits on the second sketch.
+    fn edit_dialog(command: &str, params: Value) -> (Harness, u64) {
+        let mut h = Harness::new();
+        let mut sketches = Vec::new();
+        for plane in ["XY", "XZ"] {
+            let created = h.app.run("sketch.create", json!({"plane": plane})).unwrap();
+            sketches.push(created["sketch"].as_u64().unwrap());
+            h.app.run("sketch.rectangle.two_point", json!({"p0": [2, 0], "p1": [4, 3]})).unwrap();
+            h.app.run("sketch.finish", json!({})).unwrap();
+        }
+        let mut params = params;
+        params["sketch"] = json!(sketches[0]);
+        h.app.run(command, params).unwrap();
+        let feature = h.app.session.doc.features.last().unwrap().id;
+        assert!(!solidcraft_engine::view::sketch_shown(&h.app.session, sketches[0]));
+        h.app.edit_feature(feature);
+        h.frames(1);
+        assert_eq!(h.app.session.feature_edit_sketch, Some(sketches[0]), "{command}");
+        assert!(solidcraft_engine::view::sketch_shown(&h.app.session, sketches[0]), "{command}");
+        (h, sketches[0])
+    }
+
+    #[test]
+    fn editing_shows_the_sketch_until_the_dialog_closes() {
+        let closes: [(&str, fn(&mut Harness)); 5] = [
+            ("OK", |h| steps(h, &[json!({"key": "Enter"})])),
+            ("Esc", |h| steps(h, &[json!({"key": "Escape"})])),
+            ("Cancel", |h| cancel(&mut h.app)),
+            ("another tool", |h| steps(h, &[json!({"start": "solid.box"})])),
+            ("new design", |h| {
+                h.app.run("file.new", json!({})).unwrap();
+            }),
+        ];
+        for (command, params) in [("solid.extrude", json!({"distance": 5})), ("solid.revolve", json!({"axis": "y"}))] {
+            for (how, close) in closes {
+                let (mut h, sketch) = edit_dialog(command, params.clone());
+                close(&mut h);
+                h.frames(1);
+                assert!(h.app.dialog.as_ref().is_none_or(|d| d.editing.is_none()), "{command} {how}");
+                assert_eq!(h.app.session.feature_edit_sketch, None, "{command} {how}");
+                // A new design has no such sketch; in the edited one it is hidden again.
+                if h.app.session.doc.feature(sketch).is_some() {
+                    assert!(!solidcraft_engine::view::sketch_shown(&h.app.session, sketch), "{command} {how}");
+                }
+            }
+        }
     }
 
     fn set_depth(h: &mut Harness, depth: &str) {
