@@ -452,6 +452,8 @@ pub struct Dialog {
     pub(crate) picked_edges: Vec<Sel>,
     /// Whether `inputs[0]` currently includes the tangent chains of `picked_edges`.
     pub(crate) chain_applied: bool,
+    /// A pattern's objects of the Object Type not shown now, restored when it is chosen again.
+    pub(crate) other_objects: Vec<Sel>,
     /// Shell feedback is derived from the picks, never saved as additional face references.
     shell_chain: std::cell::RefCell<Option<ShellChain>>,
     /// An extrude Press Pull opened with nothing selected: its first pick may be a curved face or
@@ -610,6 +612,11 @@ fn fits(a: Accept, s: &Sel) -> bool {
 }
 
 impl Dialog {
+    /// The command this dialog runs, whose icon and label its header shows.
+    pub(crate) fn command(&self) -> Option<&'static str> {
+        dense::command(&self.kind)
+    }
+
     /// Show why OK (or starting the sketch) was refused, for as long as the inputs stay as they are.
     fn refuse(&mut self, app: &SolveApp, error: String) {
         self.refused = Some(Refused::now(app, self));
@@ -635,6 +642,7 @@ impl Dialog {
             then_start: None,
             picked_edges: Vec::new(),
             chain_applied,
+            other_objects: Vec::new(),
             shell_chain: Default::default(),
             press_pull: false,
         }
@@ -1944,7 +1952,10 @@ fn object_type_row(d: &mut Dialog, ui: &mut egui::Ui) {
     if ty != cur {
         inp.accept = if ty == 1 { selection::FEATURES } else { BODIES };
         inp.label = objects_label(inp.accept);
-        inp.items.clear();
+        // The pre-selection moved into this input when the dialog opened, so switching back
+        // restores what the other type held instead of losing it.
+        let back = std::mem::take(&mut d.other_objects);
+        d.other_objects = std::mem::replace(&mut inp.items, back);
         d.active = 0;
     }
 }
@@ -2765,8 +2776,10 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
     }
     if keep && !cancel {
         // The canvas follows Edit Text's fields.
-        if let Kind::Text(k) = &mut d.kind {
-            crate::sketch_text::preview(app, k);
+        if let Kind::Text(k) = &mut d.kind
+            && let Some(result) = crate::sketch_text::preview(app, k)
+        {
+            d.error = result.err();
         }
         app.dialog = Some(d);
     } else if let Some((_, marker)) = d.editing {
@@ -4157,9 +4170,17 @@ pub fn axis_of(app: &SolveApp, sel: &Sel) -> Option<(Vec3, Vec3)> {
             let st = app.session.world_state();
             let sid = curves_sketch(app, std::slice::from_ref(id), None)?;
             let ss = st.sketch(sid)?;
-            let c = ss.sketch.curves.get(ss.sketch.curve_index(id)?)?;
-            let solidcraft_engine::sketch::CurveKind::Line { a, b } = c.kind else { return None };
-            let (pa, pb) = (ss.plane.to_world(ss.sketch.point(a)?), ss.plane.to_world(ss.sketch.point(b)?));
+            let (pa, pb) = if let Some(i) = ss.sketch.curve_index(id) {
+                let c = ss.sketch.curves.get(i)?;
+                let solidcraft_engine::sketch::CurveKind::Line { a, b } = c.kind else { return None };
+                (ss.plane.to_world(ss.sketch.point(a)?), ss.plane.to_world(ss.sketch.point(b)?))
+            } else {
+                let w = ss.sketch.wires.get(ss.sketch.wire_index(id)?)?;
+                if w.fit.len() != 2 {
+                    return None;
+                }
+                (*w.pts.first()?, *w.pts.last()?)
+            };
             Some((pa, (pb - pa).normalized()?))
         }
         // A straight model edge, along it.

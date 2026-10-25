@@ -7,6 +7,7 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 #![forbid(unsafe_code)]
 
+pub mod batch_params;
 pub mod capture;
 pub mod cmd;
 pub mod control_auth;
@@ -24,6 +25,7 @@ pub mod sample;
 pub mod schema;
 mod slicer_icon;
 pub mod slicers;
+pub mod snap;
 pub mod timing;
 pub mod view;
 
@@ -1337,6 +1339,8 @@ mod profile_fallback_tests;
 mod profile_refs_tests;
 #[cfg(test)]
 mod sketch_edit_removed_tests;
+#[cfg(test)]
+mod snap_tests;
 #[cfg(test)]
 mod split_face_tests;
 #[cfg(test)]
