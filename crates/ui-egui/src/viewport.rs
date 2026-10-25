@@ -1526,6 +1526,7 @@ pub(crate) fn pick_cached(app: &mut SolveApp, proj: &Proj, pos: Pos2) -> Vec<Hit
     app.session.active_sketch.hash(&mut h);
     app.tool.as_ref().map(|tool| tool.cmd).hash(&mut h);
     app.dialog.is_none().hash(&mut h);
+    app.preferences.prefer_free_sketch_points.hash(&mut h);
     crate::sketch3d::drawing(app).hash(&mut h);
     app.dialog.as_ref().and_then(|d| d.active_input()).map(|i| i.accept).hash(&mut h);
     crate::hole_place::snapping(app).hash(&mut h);
@@ -1670,19 +1671,22 @@ fn pick_hits(app: &SolveApp, proj: &Proj, pos: Pos2, other_sketch_points: bool, 
     // A face place (the Single hole's) snaps only to points their sketches show, so a nearer
     // point that isn't shown (a letter's outline) neither takes the pick nor hides a shown one.
     let snapping = app.dialog.as_ref().and_then(|d| d.active_input()).is_some_and(|i| crate::dialogs::snaps_to_points(i.accept));
+    let prefer_free = app.preferences.prefer_free_sketch_points && include_midpoints && app.tool.is_none() && app.dialog.is_none();
     let mut best = Near::new(all);
     for ss in point_sketches.iter().filter_map(|sid| st.sketch(*sid)) {
         let sid = ss.feature;
         let shown = snapping.then(|| crate::dialogs::SnapPoints::of(&ss.sketch));
         let visible = solidcraft_engine::view::SketchPointVisibility::new(&ss.sketch);
-        for p in &ss.sketch.points {
+        for (p, locked) in ss.sketch.points.iter().zip(ss.sketch.locked_points()) {
             if !visible.takes(p) || shown.as_ref().is_some_and(|f| !f.takes(p)) {
                 continue;
             }
             if let Some(sp) = proj.to_screen(ss.plane.to_world(p.pos)) {
                 let dd = sp.distance(pos) - if s.active_sketch == Some(sid) { 2.0 } else { 0.0 };
-                if dd < 8.0 && best.wants(dd) {
-                    best.offer(dd, Hit::SketchPoint { sketch: sid, id: p.id.clone(), at: p.pos });
+                // On a distance tie, grab a movable point before the origin or a linked point.
+                let rank = (dd, prefer_free && locked);
+                if dd < 8.0 && best.wants(rank) {
+                    best.offer(rank, Hit::SketchPoint { sketch: sid, id: p.id.clone(), at: p.pos });
                 }
             }
         }
@@ -3061,7 +3065,7 @@ pub fn sketch_point_at(app: &SolveApp, proj: &Proj, pos: Pos2) -> Option<(Vec2, 
     let sid = app.session.active_sketch?;
     let st = crate::open_meshing::shown_world(app);
     let ss = st.sketch(sid)?;
-    for h in pick(app, proj, pos) {
+    for h in pick_for_tool(app, proj, pos) {
         if let Hit::SketchPoint { sketch, id, at } = h
             && sketch == sid
         {
@@ -3399,6 +3403,15 @@ pub fn show(app: &mut SolveApp, ui: &mut egui::Ui) {
             && !held
             && app.dialog.is_none()
             && crate::dim_view::pick_reference(ui.ctx(), p, resp.double_clicked());
+        // Capture the press too: text editors lose focus before the click is released. A
+        // running tool keeps the keyboard for its own typed values.
+        if !held
+            && app.tool.is_none()
+            && (resp.clicked() || (resp.contains_pointer() && ui.input(|i| i.pointer.primary_pressed())))
+            && let Some(dialog) = app.dialog.as_mut()
+        {
+            dialog.restore_value_focus = true;
+        }
         if resp.clicked() && !held && !reference_pick {
             if app.tool.is_some() {
                 crate::tools::on_click(app, &proj, p, mods.shift);
@@ -4607,7 +4620,7 @@ pub(crate) fn scene_palette(dark: bool, mode: crate::theme::ColorVision) -> soli
         sketch_lost: rgb(t.sketch_lost),
         sketch_construction: rgb(t.sketch_construction),
         sketch_centerline: rgb(t.sketch_centerline),
-        axes: t.triad.map(rgb),
+        axes: t.axes().map(rgb),
         cap: rgb(t.section_cap),
         analysis: t.analysis,
     }
@@ -5036,6 +5049,43 @@ mod tests {
         let plane = &planes.last().unwrap().2;
         assert!(plane.normal().dist(-Vec3::Y) < 1e-9);
         assert!(plane.origin.dist(Vec3::new(0., 50., 10.)) < 1e-9, "{plane:?}");
+    }
+
+    #[test]
+    fn point_pick_tie_at_origin_prefers_the_drawn_point_after_deleting_coincident() {
+        let mut s = solidcraft_engine::Session::default();
+        s.execute("sketch.create", &json!({"plane": "XY"})).unwrap();
+        let drawn = s.execute("sketch.point", &json!({"point": [0, 0], "id": "drawn"})).unwrap();
+        let constraint = drawn["constraints"][0].as_str().unwrap();
+        s.execute("sketch.delete", &json!({"entities": [constraint]})).unwrap();
+        let sid = s.active_sketch.unwrap();
+        assert!(s.doc.sketch(sid).unwrap().constraints.is_empty());
+        let mut app = SolveApp::new(s, crate::Services::default());
+        let proj = projection(&app, Rect::from_min_size(Pos2::ZERO, vec2(800.0, 600.0)));
+        let at = proj.to_screen(Vec3::ZERO).unwrap();
+        assert!(app.preferences.prefer_free_sketch_points);
+        assert_eq!(sketch_point_at(&app, &proj, at).unwrap().1.as_deref(), Some("origin"), "drawing keeps its origin snap");
+        let hits = pick(&app, &proj, at);
+        assert!(matches!(hits.first(), Some(Hit::SketchPoint { id, .. }) if id == "drawn"), "{hits:?}");
+        let all = pick_all(&app, &proj, at);
+        let points: Vec<_> = all
+            .iter()
+            .filter_map(|h| match h {
+                Hit::SketchPoint { id, .. } => Some(id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(points, ["drawn", "origin"], "Select Other keeps both points");
+        assert!(matches!(pick_cached(&mut app, &proj, at).first(), Some(Hit::SketchPoint { id, .. }) if id == "drawn"));
+        let saved = crate::prefs::set(&mut app, &json!({"prefer_free_sketch_points": false})).unwrap();
+        assert_eq!(saved["prefer_free_sketch_points"], false);
+        assert!(matches!(pick_cached(&mut app, &proj, at).first(), Some(Hit::SketchPoint { id, .. }) if id == "origin"));
+        assert!(matches!(pick_all(&app, &proj, at).first(), Some(Hit::SketchPoint { id, .. }) if id == "origin"));
+        let Some(Hit::SketchPoint { id, .. }) = hits.first() else { panic!("no point picked") };
+        app.run("sketch.drag", json!({"entity": id, "from": [0, 0], "to": [10, 5]})).unwrap();
+        let sk = app.session.doc.sketch(sid).unwrap();
+        assert!(sk.point(sk.resolve_point("drawn").unwrap()).unwrap().dist(Vec2::new(10.0, 5.0)) < 1e-6);
+        assert_eq!(sk.point(0), Some(Vec2::ZERO));
     }
 
     /// Every tangent seam Continuity Analysis reports keeps its colour while the pointer rests on
@@ -5569,7 +5619,7 @@ mod tests {
     /// window's theme (#974) and colour vision mode (#778). The light theme's tokens are the engine's own colours, so a
     /// light picture in Off is unchanged; otherwise each part takes the token the window draws it
     /// with. Sketch states follow what the window does with them (`sketch_color`) and the axes the
-    /// mode's triad, so the two can't drift apart.
+    /// mode's axis colours, so the two can't drift apart.
     #[test]
     fn pictures_are_drawn_in_the_windows_theme() {
         use crate::theme::ColorVision;
@@ -5585,7 +5635,7 @@ mod tests {
         assert_ne!(p.background, Palette::DEFAULT.background);
         for (dark, mode) in [false, true].into_iter().flat_map(|d| ColorVision::ALL.map(|m| (d, m))) {
             let (p, t) = (scene_palette(dark, mode), Tokens::themed(dark, mode));
-            assert_eq!(p.axes, t.triad.map(rgb), "dark {dark}, {mode:?}: the axes");
+            assert_eq!(p.axes, t.axes().map(rgb), "dark {dark}, {mode:?}: the axes");
             assert_eq!(p.analysis, t.analysis, "dark {dark}, {mode:?}: the surface analysis");
             for (tag, cpu) in [
                 (colors::SKETCH, p.sketch),
@@ -8752,7 +8802,7 @@ mod tests {
         let t = Tokens::themed(false, ColorVision::Protan);
         assert_eq!((rg.sketch_projected, rg.sketch_locked), (rgb(t.sketch_projected), rgb(t.sketch_locked)));
         assert_ne!(rg.sketch_projected, off.sketch_projected, "the red-green table changes projected lines in light");
-        assert_eq!((rg.axes[0], rg.axes[1], rg.axes[2]), (rgb(t.triad[0]), rgb(t.triad[1]), off.axes[2]));
+        assert_eq!((rg.axes[0], rg.axes[1], rg.axes[2]), (rgb(t.axis_x), rgb(t.axis_y), off.axes[2]));
         assert_eq!((rg.sketch, rg.background, rg.grid, rg.body), (off.sketch, off.background, off.grid, off.body));
         let by = scene_palette(false, ColorVision::Tritan);
         assert_eq!(by.sketch_locked, rgb(Tokens::themed(false, ColorVision::Tritan).sketch_locked));
