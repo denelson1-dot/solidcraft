@@ -402,6 +402,7 @@ fn scene_key(app: &SolveApp) -> u64 {
     app.session.active_occurrence_path.hash(&mut h);
     app.preview.effective_replaced().hash(&mut h);
     app.preview.rolled_back.hash(&mut h);
+    app.preferences.cosmetic_threads.hash(&mut h);
     app.tree.redefine.hash(&mut h);
     crate::theme::is_dark().hash(&mut h);
     crate::theme::vision().hash(&mut h);
@@ -946,8 +947,22 @@ pub(crate) fn build_scene(app: &SolveApp) -> GpuScene {
     // are drawn as instances of them: one copy of the triangles on the GPU, and none moved on
     // the CPU.
     let mut instances = Instances::new(app, &shown, shaded);
+    let mut thread_budget = solidcraft_engine::cosmetic_threads::Budget::default();
     for b in shown {
         let faded = body_faded(app, b, &active_bodies);
+        if app.preferences.cosmetic_threads
+            && thread_budget.available()
+            && shaded
+            && !faded
+            && thread_budget.has_thread(&b.name, &st.threads)
+            && s.doc.model_body_opacity(b) >= 0.999
+            && s.doc.face_colors(b).iter().all(|(_, l)| l.opacity >= 0.999)
+        {
+            let mesh = shown_mesh(app, b, &active_bodies);
+            for (a, c) in solidcraft_engine::cosmetic_threads::segments_with_budget(b, &mesh, &st.threads, &mut thread_budget) {
+                sc.line(a.to_f32(), c.to_f32(), c4(tk.body_edge), 0.85, false);
+            }
+        }
         let base = body_color(&s.doc, b).unwrap_or(tk.body);
         let col = if faded { c4(base.gamma_multiply(0.35)) } else { c4(base) };
         // Appearances: the body's opacity, and faces with looks of their own.
@@ -5241,6 +5256,68 @@ mod tests {
         assert!(w < 5120 && w as f32 >= 2560.0 * 1.25 && u64::from(w) * u64::from(h) * 32 <= 384 << 20, "{w} x {h}");
     }
 
+    /// Ambient occlusion beside a block on a plate (#4167, #3407), seen from above with a radius
+    /// large on screen (a big design seen close up): the plate darkens toward the block and is
+    /// clear beyond the radius, with no copies of the block's outline in the darkening. The same
+    /// sample offsets at every pixel gave each sample its own shifted copy, so beside the block's
+    /// straight side every row was the same staircase. Skipped without a GPU adapter.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn ambient_occlusion_draws_no_copies_of_a_part() {
+        let mut s = solidcraft_engine::Session::default();
+        s.execute("solid.box", &json!({"length": 300, "width": 300, "height": 4, "corner": [-150, -150, -4], "body_name": "plate"})).unwrap();
+        s.execute("solid.box", &json!({"length": 30, "width": 160, "height": 16, "corner": [0, -80, 0], "operation": "new", "body_name": "block"}))
+            .unwrap();
+        let mut app = SolveApp::new(s, crate::Services::default());
+        let (yaw, pitch) = solidcraft_engine::render::StandardView::Top.angles();
+        app.cam = Camera { target: Vec3::new(-30.0, 0.0, 0.0), yaw, pitch, roll: 0.0, distance: 200.0, fov: 0.0, ..Default::default() };
+        app.ui.perspective = false;
+        app.ui.show_grid = false;
+        app.set_origin_shown(false);
+        app.ui.ground_shadow = false;
+        app.viewport.gpu = Some(GpuTarget { format: egui_wgpu::wgpu::TextureFormat::Rgba8Unorm, depth: None, samples: 1, tess: false });
+        const SIZE: u32 = 512;
+        const RADIUS: f32 = 45.0;
+        let rect = Rect::from_min_size(Pos2::ZERO, vec2(SIZE as f32, SIZE as f32));
+        let proj = projection(&app, rect);
+        let e = proj.cam.eye().to_f32();
+        let eye = [e[0], e[1], e[2], 0.0];
+        let render =
+            |radius: f32| crate::gpu::render_offscreen_ao(build_scene(&app).merged(), proj.vp.to_f32(), proj.cam.back().to_f32(), eye, SIZE, radius);
+        let (Some(off), Some(on)) = (render(0.0), render(RADIUS)) else {
+            eprintln!("skipping: no GPU adapter");
+            return;
+        };
+        let (w, r) = (f64::from(SIZE), scene_radius(&app));
+        let at = |p: Vec3| proj.cam.to_screen(p, w, w, r).unwrap();
+        // The block's left side on screen, the radius in pixels, and rows beside the middle of
+        // the side, far enough from its ends that every sample's copy spans them all.
+        let edge = at(Vec3::new(0.0, 0.0, 16.0)).0;
+        let reach = (at(Vec3::new(f64::from(RADIUS), 0.0, 0.0)).0 - at(Vec3::ZERO).0).abs();
+        let (a, b) = (at(Vec3::new(-10.0, 10.0, 0.0)).1.round() as usize, at(Vec3::new(-10.0, -10.0, 0.0)).1.round() as usize);
+        let (y0, y1) = (a.min(b), a.max(b));
+        assert!(reach > 100.0 && y1 > y0 + 20, "{reach} px, rows {y0}..{y1}");
+        let lum = |img: &[u8], x: usize, y: usize| img[(y * SIZE as usize + x) * 4..][..3].iter().map(|&c| f64::from(c)).sum::<f64>();
+        // The plate's visibility in each column: its brightness with AO over its brightness
+        // without, averaged over the rows.
+        let column = |x: usize| (y0..y1).map(|y| lum(&on, x, y) / lum(&off, x, y).max(1.0)).sum::<f64>() / (y1 - y0) as f64;
+        // From 30 px beyond the radius up to 4 px from the block (its outline).
+        let from = (edge - reach - 30.0) as usize;
+        let profile: Vec<f64> = (from..=(edge - 4.0) as usize).map(column).collect();
+        let (clear, shaded) = (&profile[..20], &profile[30..]);
+        let step = shaded.windows(2).map(|p| (p[1] - p[0]).abs()).fold(0.0, f64::max);
+        eprintln!(
+            "plate {} without AO; edge {edge:.1} px, radius {reach:.1} px, rows {y0}..{y1}; clear {:.4}..{:.4}; next to the block {:.4}; largest step {step:.4}",
+            lum(&off, from, y0) / 3.0,
+            clear.iter().copied().fold(f64::INFINITY, f64::min),
+            clear.iter().copied().fold(0.0, f64::max),
+            profile[profile.len() - 1],
+        );
+        assert!(profile[profile.len() - 1] < 0.98, "the plate darkens beside the block: {:.4}", profile[profile.len() - 1]);
+        assert!(clear.iter().all(|v| (v - 1.0).abs() < 0.004), "the plate is clear beyond the radius: {clear:?}");
+        assert!(step < 0.005, "no copies of the block's outline: a step of {step:.4} between neighbouring columns");
+    }
+
     /// A hovered face lights solidly over a body drawn from its display plan on the GPU: the
     /// highlight uses the plan's triangles, not the reference mesh's other triangulation of the
     /// same face, which fought the model at equal depth and shimmered in wedges. Every face of a
@@ -8084,6 +8161,128 @@ mod tests {
                 assert!(h.app.viewport.boxsel.is_none());
             }
         }
+    }
+
+    #[test]
+    fn cosmetic_threads_use_depth_tested_lines_and_keep_selection_and_wireframe() {
+        let mut s = solidcraft_engine::Session::default();
+        s.execute("solid.cylinder", &json!({"radius":3,"height":10})).unwrap();
+        s.execute("solid.thread", &json!({"face":[3,0,5],"designation":"M6","length":5})).unwrap();
+        let mut app = SolveApp::new(s, crate::Services::default());
+        let count = |sc: GpuScene| {
+            sc.merged()
+                .lines
+                .as_chunks::<{ crate::gpu::LINE_SIZE }>()
+                .0
+                .iter()
+                .filter(|line| line.get(28..32) == Some(0.85f32.to_le_bytes().as_slice()))
+                .count()
+        };
+        assert_eq!(count(build_scene(&app)), 0, "markings are off by default");
+        let off_key = scene_key(&app);
+        app.preferences.cosmetic_threads = true;
+        assert_ne!(scene_key(&app), off_key, "toggling invalidates the scene without a camera move");
+        assert!(count(build_scene(&app)) > 20);
+        assert!(crate::control::view_scene(&app, Default::default()).lines.iter().any(|l| l.width == 0.85));
+        app.preferences.cosmetic_threads = false;
+        assert_eq!(count(build_scene(&app)), 0);
+        assert!(!crate::control::view_scene(&app, Default::default()).lines.iter().any(|l| l.width == 0.85));
+        app.preferences.cosmetic_threads = true;
+        app.session.selection = vec![Sel::Face { body: "Body1".into(), index: 0, point: Vec3::new(3., 0., 5.) }];
+        let selection = app.session.selection.clone();
+        assert!(count(build_scene(&app)) > 20);
+        assert!(!build_highlight(&app).merged().tris.is_empty());
+        assert_eq!(app.session.selection, selection);
+        app.ui.visual_style = 2;
+        assert_eq!(count(build_scene(&app)), 0);
+        app.ui.visual_style = 0;
+        app.session.visibility.hidden_bodies.push("Body1".into());
+        assert_eq!(count(build_scene(&app)), 0);
+        app.session.visibility.hidden_bodies.clear();
+        app.session.doc_mut().appearances.bodies.insert("Body1".into(), solidcraft_engine::doc::appearance::Look::custom([150, 150, 150], 0.5));
+        assert_eq!(count(build_scene(&app)), 0, "transparent bodies omit cosmetic strokes");
+        app.session.doc_mut().appearances.bodies.clear();
+        app.session.execute("component.create", &json!({"name":"Other active component"})).unwrap();
+        assert_eq!(count(build_scene(&app)), 0, "inactive bodies are faded and unmarked");
+    }
+
+    #[test]
+    fn cosmetic_threads_preference_controls_internal_and_external_markings_without_editing_the_design() {
+        for internal in [false, true] {
+            let mut s = solidcraft_engine::Session::default();
+            let face = if internal {
+                s.execute("solid.box", &json!({"length":20,"width":20,"height":10})).unwrap();
+                s.execute("solid.hole", &json!({"position":[10,10,10],"direction":[0,0,-1],"diameter":5})).unwrap();
+                json!([12.5, 10, 9])
+            } else {
+                s.execute("solid.cylinder", &json!({"radius":3,"height":10})).unwrap();
+                json!([3, 0, 9])
+            };
+            s.execute("solid.thread", &json!({"face":face,"designation":"M6","length":4})).unwrap();
+            let mut app = SolveApp::new(s, crate::Services::default());
+            let design = app.session.doc.to_json();
+            let camera = app.cam;
+            let count = |app: &SolveApp| {
+                build_scene(app)
+                    .merged()
+                    .lines
+                    .as_chunks::<{ crate::gpu::LINE_SIZE }>()
+                    .0
+                    .iter()
+                    .filter(|line| line.get(28..32) == Some(0.85f32.to_le_bytes().as_slice()))
+                    .count()
+            };
+            let key = scene_key(&app);
+            assert_eq!(count(&app), 0);
+            crate::prefs::set(&mut app, &json!({"cosmetic_threads":true})).unwrap();
+            assert_ne!(scene_key(&app), key);
+            assert!(count(&app) > 20, "internal={internal}");
+            assert!(crate::control::view_scene(&app, Default::default()).lines.iter().any(|l| l.width == 0.85));
+            crate::prefs::set(&mut app, &json!({"cosmetic_threads":false})).unwrap();
+            assert_eq!(scene_key(&app), key);
+            assert_eq!(count(&app), 0);
+            assert_eq!(app.session.doc.to_json(), design);
+            assert_eq!(app.cam, camera);
+        }
+    }
+
+    #[test]
+    fn cosmetic_thread_scene_is_bounded_for_many_occurrences_and_cached_across_camera_moves() {
+        let mut s = solidcraft_engine::Session::default();
+        let c = s.execute("component.create", &json!({"name":"Threaded pegs"})).unwrap();
+        s.execute("solid.cylinder", &json!({"radius":3,"height":20})).unwrap();
+        s.execute("solid.thread", &json!({"face":[3,0,10],"designation":"M6"})).unwrap();
+        for i in 1..96 {
+            s.execute("occurrence.copy", &json!({"component":c["component"],"translate":[i*8,0,0]})).unwrap();
+        }
+        s.execute("component.activate", &json!({"component":0})).unwrap();
+        let mut app = SolveApp::new(s, crate::Services::default());
+        let started = std::time::Instant::now();
+        app.preferences.cosmetic_threads = true;
+        let scene = build_scene(&app).merged();
+        let strokes = scene
+            .lines
+            .as_chunks::<{ crate::gpu::LINE_SIZE }>()
+            .0
+            .iter()
+            .filter(|line| line.get(28..32) == Some(0.85f32.to_le_bytes().as_slice()))
+            .count();
+        eprintln!("96 occurrence viewport scene: {strokes} cosmetic strokes, {:?}", started.elapsed());
+        assert!(strokes > 1000 && strokes <= solidcraft_engine::cosmetic_threads::MAX_SCENE_SEGMENTS);
+        let marked_occurrences: std::collections::HashSet<i32> = scene
+            .lines
+            .as_chunks::<{ crate::gpu::LINE_SIZE }>()
+            .0
+            .iter()
+            .filter(|line| line.get(28..32) == Some(0.85f32.to_le_bytes().as_slice()))
+            .filter_map(|line| line.get(0..4).and_then(|bytes| bytes.try_into().ok()).map(f32::from_le_bytes))
+            .map(|x| (x / 8.0).round() as i32)
+            .collect();
+        assert_eq!(marked_occurrences.len(), 96, "schematic density shares strokes across all 96 pegs");
+        let key = scene_key(&app);
+        app.cam.distance *= 1.5;
+        app.cam.yaw += 0.2;
+        assert_eq!(scene_key(&app), key, "ordinary camera changes reuse the scene; LOD changes have their own generation");
     }
 
     #[test]
