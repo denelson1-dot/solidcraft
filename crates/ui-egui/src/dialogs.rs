@@ -1209,15 +1209,13 @@ impl Dialog {
         inp.accepts(h, |body, face| snap.and_then(|f| f.planar(body, face)).unwrap_or_else(|| planar_face(s, body, face).is_some()))
     }
 
-    /// Extrude's automatic To Object: with profiles picked, a face or vertex off their plane, or
-    /// a plane parallel to it, is the object to extrude to rather than another profile. While the
-    /// To Object input is active, a parallel plane is taken too (as a place on it).
+    /// With automatic To Object enabled and profiles picked, a face or vertex off their plane,
+    /// or a parallel plane, is the target rather than another profile. An explicitly active
+    /// To Object input accepts parallel planes regardless of the automatic switching preference.
     fn extrude_target(&self, s: &Session, h: &Hit) -> Option<Sel> {
-        if !matches!(self.kind, Kind::Extrude { thin: false, smart: crate::smart_extrude::Smart { auto_to_object: true, .. }, .. }) {
-            return None;
-        }
+        let Kind::Extrude { thin: false, smart, .. } = &self.kind else { return None };
         let to_active = self.active_input().is_some_and(|i| i.label == TO_OBJECT);
-        if self.active != 0 && !to_active {
+        if !to_active && (self.active != 0 || !smart.auto_to_object) {
             return None;
         }
         let reference = profile_plane(s, self.inputs.first()?.items.first()?)?;
@@ -3316,6 +3314,13 @@ fn dialog_commands(app: &SolveApp, d: &Dialog) -> Result<Vec<(String, Value)>, S
         (ps.first().map(|x| json!(x.0)).unwrap_or(Value::Null), json!(ps.iter().map(|x| x.1).collect::<Vec<_>>()))
     };
     let face_points = |i: usize| -> Vec<Value> { sels(d, i).face_points().into_iter().map(pt).collect() };
+    // An empty Thickness is no value to shell with: OK waits for one instead of the command
+    // refusing it with an error that asks for an issue report (#960).
+    if let Kind::Shell { thickness } = &d.kind
+        && thickness.trim().is_empty()
+    {
+        return Err("enter the thickness".into());
+    }
     let (cmd, params): (&str, Value) = match &d.kind {
         Kind::ChatContext => return Err("the chat takes these picks; nothing runs".into()),
         Kind::Extrude {
@@ -5568,5 +5573,32 @@ mod shell_body_tests {
         let (cmd, p) = commands.first().unwrap();
         assert_eq!(cmd, "solid.shell");
         assert_eq!(p["body"], json!(upper), "{p}");
+    }
+}
+
+#[cfg(test)]
+mod shell_thickness_tests {
+    //! Shell with its Thickness box emptied (#960).
+
+    use super::*;
+    use crate::scenario::Harness;
+
+    #[test]
+    fn an_empty_thickness_makes_no_command() {
+        let mut h = Harness::new();
+        h.app.run("solid.box", json!({"length":20,"width":20,"height":10,"corner":[0,0,0]})).unwrap();
+        h.step(&json!({"call":"ui.view","params":{"view":"top"}})).unwrap();
+        h.settle();
+        h.step(&json!({"start":"solid.shell"})).unwrap();
+        h.step(&json!({"click":{"world":[10,10,10]}})).unwrap();
+        h.frames(2);
+        let d = h.app.dialog.as_ref().expect("the shell dialog");
+        assert_eq!(d.inputs[0].items.len(), 1, "the top face is picked");
+        assert!(dialog_commands(&h.app, d).is_ok(), "2 mm by default");
+        if let Some(Dialog { kind: Kind::Shell { thickness }, .. }) = h.app.dialog.as_mut() {
+            thickness.clear();
+        }
+        let d = h.app.dialog.as_ref().unwrap();
+        assert_eq!(dialog_commands(&h.app, d).err().as_deref(), Some("enter the thickness"));
     }
 }
