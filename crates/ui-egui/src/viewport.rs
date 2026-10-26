@@ -124,6 +124,10 @@ pub struct ViewportState {
     pub(crate) modifier_nav: Option<(NavMode, Pos2)>,
     /// What a click would pick now (after the active command's filter).
     pub hover: Option<Hit>,
+    /// The centre of the circle or arc of the sketch being edited whose edge was hovered last
+    /// (sketch, point id): it is drawn, and it takes the pointer from further away
+    /// ([`WOKEN_CENTRE_PX`]), until another curve or point is hovered.
+    pub woken_centre: Option<(u64, String)>,
     pub mouse: Option<Pos2>,
     /// Box selection being dragged.
     pub boxsel: Option<BoxSel>,
@@ -381,6 +385,7 @@ fn in_view(proj: &Proj, b: &solidcraft_engine::geom::Aabb3) -> bool {
 fn scene_key(app: &SolveApp) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     app.session.revision.hash(&mut h);
+    app.session.colored_components.hash(&mut h);
     (std::sync::Arc::as_ptr(&crate::open_meshing::shown_world(app)) as usize).hash(&mut h);
     app.ui.show_grid.hash(&mut h);
     app.ui.visual_style.hash(&mut h);
@@ -964,12 +969,15 @@ pub(crate) fn build_scene(app: &SolveApp) -> GpuScene {
                 sc.line(a.to_f32(), c.to_f32(), c4(tk.body_edge), 0.85, false);
             }
         }
-        let base = body_color(&s.doc, b).unwrap_or(tk.body);
+        let base = solidcraft_engine::view::component_color(s, b.component)
+            .map(|[r, g, b]| Color32::from_rgb(r, g, b))
+            .or_else(|| body_color(&s.doc, b))
+            .unwrap_or(tk.body);
         let col = if faded { c4(base.gamma_multiply(0.35)) } else { c4(base) };
         // Appearances: the body's opacity, and faces with looks of their own.
         let opacity = s.doc.model_body_opacity(b);
         let face_looks: std::collections::HashMap<usize, solidcraft_engine::doc::appearance::Look> =
-            if shaded { s.doc.face_colors(b).into_iter().collect() } else { Default::default() };
+            if shaded && s.colored_components.is_none() { s.doc.face_colors(b).into_iter().collect() } else { Default::default() };
         let opaque = !faded && opacity >= 0.999 && face_looks.values().all(|l| l.opacity >= 0.999);
         let planned = drawn_plan(app, b, opaque);
         let on_gpu = planned.is_some();
@@ -1036,9 +1044,9 @@ pub(crate) fn build_scene(app: &SolveApp) -> GpuScene {
     if app.ui.ground_shadow && app.ui.visual_style != 2 && app.cam.pitch > 0.0 {
         ground_shadow(&mut sc, app, &st);
     }
-    // Section: the outline of each body where the plane cuts it.
+    // Section: the outline of each body where the plane cuts it, in the view's text colour (#4146).
     if let Some((o, n)) = section_plane(app) {
-        let col = c4(tk.text.gamma_multiply(0.9));
+        let col = c4(Tokens::view().text.gamma_multiply(0.9));
         let mut kept = app.viewport.section_index.lock().map(|mut k| std::mem::take(&mut *k)).unwrap_or_default();
         let mut made = Vec::new();
         for b in st.bodies.iter().filter(|b| app.session.body_visible(&b.name)) {
@@ -1224,7 +1232,7 @@ fn ground_shadow(sc: &mut GpuScene, app: &SolveApp, st: &std::sync::Arc<solidcra
     if !(rx > 0.0 && ry > 0.0) {
         return;
     }
-    let dark = if crate::theme::is_dark() { 150 } else { 80 };
+    let dark = if crate::theme::viewport_dark() { 150 } else { 80 };
     // Rings from the middle out, fading to nothing.
     let rings = [(0.0, dark), (0.55, dark * 3 / 4), (0.85, dark / 3), (1.0, 0)];
     let n = 48;
@@ -1527,6 +1535,7 @@ pub(crate) fn pick_cached(app: &mut SolveApp, proj: &Proj, pos: Pos2) -> Vec<Hit
     app.tool.as_ref().map(|tool| tool.cmd).hash(&mut h);
     app.dialog.is_none().hash(&mut h);
     app.preferences.prefer_free_sketch_points.hash(&mut h);
+    app.viewport.woken_centre.hash(&mut h);
     crate::sketch3d::drawing(app).hash(&mut h);
     app.dialog.as_ref().and_then(|d| d.active_input()).map(|i| i.accept).hash(&mut h);
     crate::hole_place::snapping(app).hash(&mut h);
@@ -1673,6 +1682,9 @@ fn pick_hits(app: &SolveApp, proj: &Proj, pos: Pos2, other_sketch_points: bool, 
     let snapping = app.dialog.as_ref().and_then(|d| d.active_input()).is_some_and(|i| crate::dialogs::snaps_to_points(i.accept));
     let prefer_free = app.preferences.prefer_free_sketch_points && include_midpoints && app.tool.is_none() && app.dialog.is_none();
     let mut best = Near::new(all);
+    // A woken centre's extra reach (past the usual 8) yields to a curve under the pointer, so a
+    // click on a small circle's edge still takes the circle.
+    let mut woken_far: Option<(f32, Hit)> = None;
     for ss in point_sketches.iter().filter_map(|sid| st.sketch(*sid)) {
         let sid = ss.feature;
         let shown = snapping.then(|| crate::dialogs::SnapPoints::of(&ss.sketch));
@@ -1685,29 +1697,36 @@ fn pick_hits(app: &SolveApp, proj: &Proj, pos: Pos2, other_sketch_points: bool, 
                 let dd = sp.distance(pos) - if s.active_sketch == Some(sid) { 2.0 } else { 0.0 };
                 // On a distance tie, grab a movable point before the origin or a linked point.
                 let rank = (dd, prefer_free && locked);
+                let woken = app.viewport.woken_centre.as_ref().is_some_and(|(k, id)| *k == sid && *id == p.id);
                 if dd < 8.0 && best.wants(rank) {
                     best.offer(rank, Hit::SketchPoint { sketch: sid, id: p.id.clone(), at: p.pos });
+                } else if woken && dd < WOKEN_CENTRE_PX && woken_far.as_ref().is_none_or(|(d0, _)| dd < *d0) {
+                    woken_far = Some((dd, Hit::SketchPoint { sketch: sid, id: p.id.clone(), at: p.pos }));
                 }
             }
         }
     }
     hits.extend(best.hits());
-    // Sketch curves (the active sketch wins ties).
+    // Sketch curves: the active sketch's own before projected and other sketches' ones, then
+    // nearest (the active sketch wins ties).
     let mut bestc = Near::new(all);
     for sid in visible_sketches(app) {
         let Some(ss) = st.sketch(sid) else { continue };
-        let bonus = if s.active_sketch == Some(sid) { 2.0 } else { 0.0 };
+        let active = s.active_sketch == Some(sid);
+        let bonus = if active { 2.0 } else { 0.0 };
+        let tier = |own: bool| u8::from(!(active && own));
         for (i, c) in ss.sketch.curves.iter().enumerate() {
             if !solidcraft_engine::view::sketch_curve_visible(&ss.sketch, i) {
                 continue;
             }
             let straight = matches!(c.kind, CurveKind::Line { .. });
+            let tier = tier(c.link.is_none() || ss.sketch.is_text_curve(i));
             for part in &crate::sketch_display::curve_sample(app, sid, i, &ss.plane, proj).parts {
                 let pts: Vec<Pos2> = part.iter().filter_map(|q| proj.to_screen(*q)).collect();
                 for w in pts.windows(2) {
                     let dd = seg_dist(pos, w[0], w[1]) - bonus;
-                    if dd < 6.0 && bestc.wants(dd) {
-                        bestc.offer(dd, Hit::SketchCurve { sketch: sid, id: c.id.clone(), straight });
+                    if dd < 6.0 && bestc.wants((tier, dd)) {
+                        bestc.offer((tier, dd), Hit::SketchCurve { sketch: sid, id: c.id.clone(), straight });
                     }
                 }
             }
@@ -1715,16 +1734,24 @@ fn pick_hits(app: &SolveApp, proj: &Proj, pos: Pos2, other_sketch_points: bool, 
         // 3D sketch curves (paths for sweeps and pipes).
         for w in &ss.sketch.wires {
             let straight = w.fit.len() == 2;
+            let tier = tier(w.link.is_none());
             let pts: Vec<Pos2> = w.pts.iter().filter_map(|q| proj.to_screen(*q)).collect();
             for seg in pts.windows(2) {
                 let dd = seg_dist(pos, seg[0], seg[1]) - bonus;
-                if dd < 6.0 && bestc.wants(dd) {
-                    bestc.offer(dd, Hit::SketchCurve { sketch: sid, id: w.id.clone(), straight });
+                if dd < 6.0 && bestc.wants((tier, dd)) {
+                    bestc.offer((tier, dd), Hit::SketchCurve { sketch: sid, id: w.id.clone(), straight });
                 }
             }
         }
     }
+    let before_curves = hits.len();
     hits.extend(bestc.hits());
+    if let Some((_, far)) = woken_far
+        && hits.len() == before_curves
+        && !hits.iter().any(|h| matches!(h, Hit::SketchPoint { .. }))
+    {
+        hits.push(far);
+    }
     // A section hides the material its normal points at: nothing there is picked, and where the
     // plane crosses a body its cap hides what lies behind it (#6328), as `view.pick` answers.
     let section = section_plane(app);
@@ -3188,6 +3215,7 @@ pub fn show(app: &mut SolveApp, ui: &mut egui::Ui) {
         candidate(app, &hits).map(|(h, s)| (h, Some(s)))
     };
     app.viewport.hover = cand.as_ref().map(|c| c.0.clone());
+    wake_centre(app, &hits);
     // Select Other: a press held still opens the list of everything under it; while the list is
     // open its row under the pointer is what lights up.
     let held =
@@ -3785,7 +3813,7 @@ pub fn show(app: &mut SolveApp, ui: &mut egui::Ui) {
             Align2::CENTER_BOTTOM,
             "Saved sketch plane — attachment lost",
             FontId::proportional(t.font_body),
-            t.warning,
+            Tokens::view().warning,
         );
     }
     if let Some(bx) = app.viewport.boxsel {
@@ -4469,6 +4497,56 @@ fn hover_highlight(app: &SolveApp, painter: &egui::Painter, proj: &Proj) {
         }
         _ => {}
     }
+    // The centre of the circle or arc hovered last: a cross in a ring, where a click takes it.
+    if let Some((sketch, id)) = &app.viewport.woken_centre
+        && !matches!(&app.viewport.hover, Some(Hit::SketchPoint { id: h, .. }) if h == id)
+        && let Some(ss) = st.sketch(*sketch)
+        && let Some(at) = ss.sketch.resolve_point(id).and_then(|i| ss.sketch.point(i))
+        && let Some(p) = proj.to_screen(ss.plane.to_world(at))
+    {
+        let stroke = Stroke::new(1.5, col);
+        painter.circle_stroke(p, 5.0, stroke);
+        painter.line_segment([p - vec2(4.0, 0.0), p + vec2(4.0, 0.0)], stroke);
+        painter.line_segment([p - vec2(0.0, 4.0), p + vec2(0.0, 4.0)], stroke);
+        crate::scenario::publish_handle("woken_centre", p);
+    }
+}
+
+/// How near the pointer must come to the woken centre of a circle or arc (screen points),
+/// against 8 for other sketch points.
+const WOKEN_CENTRE_PX: f32 = 16.0;
+
+/// Hovering a circle's or an arc's edge in the sketch being edited wakes its centre: drawn, and
+/// picked from further away, so a line or a dimension is easily taken to it, and it stays awake
+/// while the pointer crosses the circle's inside to it. Hovering another curve or point (but
+/// that centre) puts it back to sleep, as does leaving the sketch.
+fn wake_centre(app: &mut SolveApp, hits: &[Hit]) {
+    let Some(active) = app.session.active_sketch else {
+        app.viewport.woken_centre = None;
+        return;
+    };
+    let first = hits.iter().find(|h| matches!(h, Hit::SketchPoint { sketch, .. } | Hit::SketchCurve { sketch, .. } if *sketch == active));
+    let st = crate::open_meshing::shown_world(app);
+    match first {
+        Some(Hit::SketchCurve { id, .. }) => {
+            let centre = st.sketch(active).and_then(|ss| {
+                let sk = &ss.sketch;
+                let c = match sk.curves.get(sk.curve_index(id)?)?.kind {
+                    CurveKind::Circle { c, .. } | CurveKind::Arc { c, .. } => c,
+                    _ => return None,
+                };
+                Some(sk.points.get(c)?.id.clone())
+            });
+            app.viewport.woken_centre = centre.map(|id| (active, id));
+        }
+        Some(Hit::SketchPoint { id, .. }) if app.viewport.woken_centre.as_ref().is_some_and(|(_, w)| w == id) => {}
+        Some(_) => app.viewport.woken_centre = None,
+        None => {
+            if app.viewport.woken_centre.as_ref().is_some_and(|(k, _)| *k != active) {
+                app.viewport.woken_centre = None;
+            }
+        }
+    }
 }
 
 /// A midpoint stays attached to its edge; hover and selection share the same marker.
@@ -4552,16 +4630,18 @@ fn overlays(app: &SolveApp, painter: &egui::Painter, proj: &Proj) {
             painter.rect_filled(Rect::from_center_size(sp, vec2(5.0, 5.0)), 0.0, c);
         }
     }
+    // The markers and the status line are drawn straight onto the view: its side's colours (#4146).
+    let v = Tokens::view();
     for selected in &app.session.selection {
         if let Sel::SketchMidpoint { id } = selected
             && let Some(line) = sk.curve_index(id)
             && let Some(at) = crate::selection::line_midpoint(sk, line)
             && let Some(screen) = proj.to_screen(ss.plane.to_world(at))
         {
-            midpoint_marker(painter, screen, t.sel_edge);
+            midpoint_marker(painter, screen, v.sel_edge);
         }
     }
-    loose_end_markers(sk, &ss.ends, &ss.plane, painter, proj, &t);
+    loose_end_markers(sk, &ss.ends, &ss.plane, painter, proj, &v);
     // Sketch status.
     if let Some(r) = app.viewport.layout.as_ref().map(|l| l.content) {
         let msg = if !ss.report.ok() {
@@ -4571,7 +4651,7 @@ fn overlays(app: &SolveApp, painter: &egui::Painter, proj: &Proj) {
         } else {
             format!("{} — {} degrees of freedom", ss.name, ss.report.dof)
         };
-        let c = if ss.report.ok() { t.sketch_accent } else { t.error };
+        let c = if ss.report.ok() { v.sketch_accent } else { v.error };
         painter.text(pos2(r.left() + 12.0, r.top() + 12.0), Align2::LEFT_TOP, msg, FontId::proportional(t.font_button), c);
     }
 }
@@ -5676,6 +5756,37 @@ mod tests {
             let near = px.iter().zip([want.r(), want.g(), want.b()]).all(|(a, b)| a.abs_diff(b) <= 2);
             assert!(near, "dark {dark}: top row {px:?}, the window's background {want:?}");
         }
+    }
+
+    /// Changing only the 3D view's dark or light (#4146) rebuilds the view's scene and highlights
+    /// in its colours, as a change of the window's theme does.
+    #[test]
+    fn changing_only_the_views_dark_or_light_rebuilds_its_scene() {
+        let mut h = crate::scenario::Harness::new();
+        h.app.run("solid.box", json!({"length": 40, "width": 30, "height": 20})).unwrap();
+        h.call("ui.prefs", json!({"theme": "dark"}));
+        h.frames(2);
+        let before = (scene_key(&h.app), highlight_geometry_key(&h.app));
+        h.call("ui.prefs", json!({"viewport_theme": "light"}));
+        h.frames(2);
+        assert!(h.app.ui.dark, "the window stays dark");
+        assert_ne!(scene_key(&h.app), before.0, "the scene is rebuilt");
+        assert_ne!(highlight_geometry_key(&h.app), before.1, "and so are the highlights");
+    }
+
+    /// A section's cut outlines are drawn onto the view, so a light view in a dark window draws
+    /// them in the light side's text colour (#4146): the window's would be pale on the light view.
+    #[test]
+    fn a_sections_outlines_take_the_views_text_colour() {
+        let mut h = crate::scenario::Harness::new();
+        h.app.run("solid.box", json!({"length": 40, "width": 30, "height": 20})).unwrap();
+        h.app.run("inspect.section", json!({"plane": "XZ", "at": 15})).unwrap();
+        h.call("ui.prefs", json!({"theme": "dark", "viewport_theme": "light"}));
+        h.frames(2);
+        let colours: Vec<[u8; 4]> = build_scene(&h.app).lines.as_chunks::<32>().0.iter().map(|l| [l[24], l[25], l[26], l[27]]).collect();
+        let (view, window) = (Tokens::light().text.gamma_multiply(0.9), Tokens::dark().text.gamma_multiply(0.9));
+        assert!(colours.contains(&c4(view)), "the outlines in the view's text colour");
+        assert!(!colours.contains(&c4(window)), "none in the window's");
     }
 
     /// The view's picture is cut by the section the viewport shows: an open Section Analysis
