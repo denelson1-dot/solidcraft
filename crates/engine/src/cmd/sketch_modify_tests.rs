@@ -730,6 +730,22 @@ fn move_rotation_turns_line_angle_dimension() {
     assert!(close(d.len(), length) && close(d.angle(), 120f64.to_radians()), "{d:?}");
 }
 
+/// #5034: a circle drawn with its centre on the fixed origin is ordinary geometry: it keeps a
+/// centre of its own, and `sketch.move` takes it to the place asked for.
+#[test]
+fn a_circle_drawn_at_the_origin_can_be_moved() {
+    let mut s = new_sketch();
+    let drawn = run(&mut s, "sketch.circle.center", json!({"center": "origin", "radius": 10}));
+    let c = ids(&drawn["curves"])[0].clone();
+    // The circle's centre is a point of the sketch, and the sketch can name it.
+    assert!(sketch(&s).resolve_point(&format!("{c}.center")).is_some(), "the circle's centre is a point of the sketch");
+    let moved = run(&mut s, "sketch.move", json!({"entities": [c], "translate": [10, 5]}));
+    let sk = sketch(&s);
+    let centre = sk.center(sk.curve_index(&c).unwrap()).unwrap();
+    assert!(centre.dist(Vec2::new(10.0, 5.0)) < 1e-7, "the circle moved where it was asked to: {centre:?}");
+    assert!(moved["sketch"]["solved"].as_bool().unwrap_or(false), "the sketch stayed solved: {moved}");
+}
+
 /// #1485: after a circle is trimmed between two construction lines, clicking the trimmed end
 /// picks the construction line's end lying there, not the arc's own; the tangent arc still starts
 /// from the trimmed arc, tangent to it.
@@ -2054,6 +2070,47 @@ fn an_offset_leaves_its_source_lines_free_to_turn() {
     let o = run(&mut s, "sketch.offset", json!({"curves": [ids(&polygon["curves"])[0]], "distance": 1, "side": [115, 15]}));
     assert!(o["association"].is_string(), "{o}");
     assert_eq!(o["sketch"]["dof"], corners["sketch"]["dof"], "{o}");
+}
+
+#[test]
+fn an_offset_slot_still_moves_with_the_dimension_that_places_it() {
+    // #6569: an offset arc shares its source's centre and its ends are held while the sketch
+    // solves. Its own arc condition tied that centre to the middle of the held ends: the slot
+    // lost a degree of freedom, and the length that places it was refused as conflicting.
+    let build = |offset: bool| {
+        let mut s = new_sketch();
+        run(&mut s, "sketch.line", json!({"points": [[0, 20], [0, 10]], "construction": true}));
+        run(&mut s, "sketch.constraint.fix", json!({"entity": "l1.start"}));
+        run(&mut s, "sketch.constraint.horizontal_vertical", json!({"line": "l1", "mode": "vertical"}));
+        run(&mut s, "sketch.dimension", json!({"entities": ["l1"], "value": "a = 10"}));
+        let slot = run(&mut s, "sketch.slot.center_to_center", json!({"p0": [0, 10], "p1": [8, 10], "width": 3}));
+        let dof = if offset {
+            run(&mut s, "sketch.offset", json!({"curves": ["l2"], "distance": 1, "side": [4, 5]}))["sketch"]["dof"].clone()
+        } else {
+            slot["sketch"]["dof"].clone()
+        };
+        (s, dof)
+    };
+    let (mut plain, without) = build(false);
+    let (mut s, with) = build(true);
+    assert_eq!(with, without, "the offset takes no freedom away from the slot");
+    for s in [&mut plain, &mut s] {
+        run(s, "parameters.change", json!({"name": "a", "expression": "8"}));
+    }
+    // The slot moves as it does without the offset, and the offset follows it, 1 mm out.
+    let (a, b) = (sketch(&plain), sketch(&s));
+    for p in &a.points {
+        let q = b.points.iter().find(|q| q.id == p.id).unwrap();
+        assert!(p.pos.dist(q.pos) < 1e-9, "{} at {:?}, without the offset at {:?}", p.id, q.pos, p.pos);
+    }
+    let arc = |id: &str| match b.curves[b.curve_index(id).unwrap()].kind {
+        CurveKind::Arc { c, a, .. } => (c, b.points[a].pos.dist(b.points[c].pos)),
+        ref other => panic!("{id} is {other:?}"),
+    };
+    for (source, output) in [("a1", "a3"), ("a2", "a4")] {
+        let ((c, r), (oc, or)) = (arc(source), arc(output));
+        assert!(c == oc && close(or - r, 1.0), "{output} is round {source}'s centre, 1 mm out: {r} and {or}");
+    }
 }
 
 #[test]

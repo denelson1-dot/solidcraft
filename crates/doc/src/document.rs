@@ -98,11 +98,34 @@ pub enum PlaneRef {
 
 /// Complete source curves of an outer boundary and each of its holes. Unlike a
 /// span multiset, this identity is independent of adaptive spline subdivision.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+///
+/// A loop is a set of curves: `outer` is kept sorted, and `holes` sorted by their own ids, as
+/// the sketch's profiles produce them. Any start and either direction of the same loop is
+/// accepted and made canonical on load, so a design written by hand or by another writer still
+/// opens (#6499).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct WholeProfileBoundary {
     pub outer: Vec<String>,
     pub holes: Vec<Vec<String>>,
+}
+
+impl<'de> Deserialize<'de> for WholeProfileBoundary {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        /// The written form, before the loop order is dropped.
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Written {
+            outer: Vec<String>,
+            holes: Vec<Vec<String>>,
+        }
+        let Written { mut outer, mut holes } = Written::deserialize(deserializer)?;
+        outer.sort();
+        for hole in &mut holes {
+            hole.sort();
+        }
+        holes.sort();
+        Ok(Self { outer, holes })
+    }
 }
 
 /// Which closed profiles of a sketch a feature uses.
@@ -2464,6 +2487,33 @@ pub struct Feature {
     pub kind: FeatureKind,
 }
 
+impl Feature {
+    /// Where in `body_names` the names of the first `count` bodies the feature builds are kept,
+    /// in the order it builds them. The same index for most features. An Import keeps its names
+    /// by the file's body index, and builds no body for the file bodies it skips, so its built
+    /// bodies pass their slots by (#2175).
+    pub fn body_name_slots(&self, count: usize) -> Vec<usize> {
+        let skip: std::collections::HashSet<u64> = match &self.kind {
+            FeatureKind::Import { skip, .. } => skip.iter().copied().collect(),
+            _ => Default::default(),
+        };
+        (0..count.saturating_add(skip.len())).filter(|k| !skip.contains(&(*k as u64))).take(count).collect()
+    }
+
+    /// Keep `made`, the names the feature's bodies have now (in the order it builds them), as
+    /// its stored names, so they stay as they are whatever comes and goes before it. An Import's
+    /// skipped file bodies keep the names stored for them.
+    pub fn pin_body_names(&mut self, made: &[String]) {
+        let slots = self.body_name_slots(made.len());
+        self.body_names.resize(slots.last().map_or(0, |s| s + 1), String::new());
+        for (slot, name) in slots.iter().zip(made) {
+            if let Some(stored) = self.body_names.get_mut(*slot) {
+                stored.clone_from(name);
+            }
+        }
+    }
+}
+
 fn inside_str() -> String {
     "inside".into()
 }
@@ -2842,7 +2892,7 @@ impl Document {
     }
 
     /// Rename body `old` to `new` where the design keeps things by body name outside its
-    /// features: materials, appearances, configuration columns, offsets, components and the
+    /// features: materials, appearances, plastic rules, configuration columns, offsets, components and the
     /// browser's groups and order. (The features are the rename command's to change.)
     ///
     /// A name the design numbered (`Body1`) is not used again after the rename: the design's
@@ -2854,6 +2904,9 @@ impl Document {
         }
         if let Some(m) = self.materials.remove(old) {
             self.materials.insert(new.to_string(), m);
+        }
+        if let Some(rule) = self.plastic.assigned.remove(old) {
+            self.plastic.assigned.insert(new.to_string(), rule);
         }
         if let Some(c) = self.appearances.bodies.remove(old) {
             self.appearances.bodies.insert(new.to_string(), c);
@@ -2907,8 +2960,10 @@ impl Document {
                 continue;
             }
             let now = made(a.id);
+            // The stored slot of each body built now (an Import's pass its skipped bodies by).
+            let at: std::collections::HashMap<usize, &String> = b.body_name_slots(now.len()).into_iter().zip(&now).collect();
             for (k, name) in b.body_names.iter().enumerate() {
-                let current = now.get(k);
+                let current = at.get(&k).copied();
                 // Slots the rename left alone, and the ones it set to the names they have now.
                 if a.body_names.get(k) == Some(name) || name.trim().is_empty() || current == Some(name) {
                     continue;

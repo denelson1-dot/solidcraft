@@ -956,6 +956,8 @@ pub struct EvalCache {
     order: std::collections::VecDeque<u64>,
     /// What the stored results cost together.
     bytes: usize,
+    /// The byte budget (0: [`CACHE_BYTES`]).
+    pub(crate) budget: usize,
     pub hits: usize,
 }
 
@@ -997,7 +999,8 @@ impl EvalCache {
         self.bytes = self.bytes.saturating_add(bytes);
         // One result is always kept, so a single state larger than the budget cannot empty the
         // cache and force a full recompute on every undo.
-        while self.order.len() > CACHE_ENTRIES || (self.bytes > CACHE_BYTES && self.order.len() > 1) {
+        let budget = if self.budget == 0 { CACHE_BYTES } else { self.budget };
+        while self.order.len() > CACHE_ENTRIES || (self.bytes > budget && self.order.len() > 1) {
             if let Some(k) = self.order.pop_front()
                 && let Some(old) = self.map.remove(&k)
             {
@@ -1096,6 +1099,22 @@ impl ModelState {
     pub fn retained_bytes(&self) -> usize {
         let bodies: usize = self.bodies.iter().map(|b| if b.bytes > 0 { b.bytes } else { b.body.retained_bytes() }).sum();
         let sketches: usize = self.sketches.iter().map(|s| s.retained_bytes()).sum();
+        bodies + sketches + self.sheets.len() * 4096 + self.threads.len() * 192 + self.construct.len() * 192
+    }
+
+    /// [`ModelState::retained_bytes`] of what this state holds that `before` does not: bodies
+    /// and sketches it shares with `before` are already paid for by the cached state that made
+    /// them. Charging every cached state its whole model let a design whose model is large next
+    /// to the budget keep only its last few states, so setting a parameter back recomputed what
+    /// had dropped out.
+    fn added_bytes(&self, before: &ModelState) -> usize {
+        let bodies: usize = self
+            .bodies
+            .iter()
+            .filter(|b| !before.bodies.iter().any(|o| o.body.same_shape(&b.body)))
+            .map(|b| if b.bytes > 0 { b.bytes } else { b.body.retained_bytes() })
+            .sum();
+        let sketches: usize = self.sketches.iter().filter(|s| !before.sketches.iter().any(|o| Arc::ptr_eq(o, s))).map(|s| s.retained_bytes()).sum();
         bodies + sketches + self.sheets.len() * 4096 + self.threads.len() * 192 + self.construct.len() * 192
     }
 
@@ -1446,7 +1465,43 @@ fn chain_fingerprint(
         }
         fp = h.finish();
     }
+    // A pattern or mirror of features replays its sources' definitions wherever they are in the
+    // timeline. One made with the timeline rolled back comes before them, where the chain doesn't
+    // cover them: its copies kept the size the sources had when they were made.
+    if let FeatureKind::Pattern { features, bodies, .. } | FeatureKind::Mirror { features, bodies, .. } = &f.kind
+        && bodies.is_empty()
+        && !features.is_empty()
+    {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        fp.hash(&mut h);
+        for g in replayed_sources(doc, features) {
+            fingerprint(doc, 0, g, vals, false, steps).hash(&mut h);
+        }
+        fp = h.finish();
+    }
     fp
+}
+
+/// The features a pattern or mirror of `features` replays: each source, and the sources of one
+/// that is itself a pattern or mirror of features (see `copy_plan`), each once.
+fn replayed_sources<'a>(doc: &'a Document, features: &[crate::FeatureName]) -> Vec<&'a Feature> {
+    let mut out: Vec<&Feature> = Vec::new();
+    let mut todo: Vec<String> = crate::plain(features);
+    // A bound on the walk, as on the copy plan's nesting: a design can't make it run on.
+    for _ in 0..1024 {
+        let Some(name) = todo.pop() else { break };
+        let Ok(g) = source_feature(doc, &name) else { continue };
+        if out.iter().any(|x| x.id == g.id) {
+            continue;
+        }
+        if let FeatureKind::Pattern { features, bodies, .. } | FeatureKind::Mirror { features, bodies, .. } = &g.kind
+            && bodies.is_empty()
+        {
+            todo.extend(crate::plain(features));
+        }
+        out.push(g);
+    }
+    out
 }
 
 /// Document-level inputs any feature may read: construction planes (resolved by name), sheet
@@ -2084,6 +2139,7 @@ impl Model {
                 continue;
             }
             recomputed += 1;
+            let before = state.clone();
             let t0 = now();
             let mut next = (*state).clone();
             // The names the design must not use again travel with the state (#4957, #4302).
@@ -2173,7 +2229,7 @@ impl Model {
                     warning: warning.clone(),
                     boolean_diagnostics: boolean_diagnostics.clone(),
                     ms,
-                    bytes: state.retained_bytes(),
+                    bytes: state.added_bytes(&before),
                     state: state.clone(),
                 };
                 if let Some(k) = &self.kept.0 {
@@ -6421,11 +6477,36 @@ fn replay(
             }
         }
         if op == Operation::Cut {
-            for instance in instances {
-                if let Some(tools) = copies.get(instance) {
+            for instance in &instances {
+                if let Some(tools) = copies.get(instance.clone()) {
                     total += 1;
                     missed += usize::from(copy_misses(st, f, &targets, tools));
                 }
+            }
+        }
+        // Copies of a cut through sheet metal are cut-outs of its flat pattern, as the cut is
+        // (#6841): each machined into the sheets in turn, then cut from the other targets.
+        if op == Operation::Cut && matches!(src.kind, FeatureKind::Extrude { .. }) && !st.sheets.is_empty() && instances.len() == mats.len() {
+            let mut handled = Vec::with_capacity(mats.len());
+            for (m, instance) in mats.iter().zip(&instances) {
+                let bodies: Vec<Body> = copies.get(instance.clone()).unwrap_or_default().iter().map(|t| t.body.clone()).collect();
+                handled.push(more::sheet_cut_copy(f, src, m, st, &bodies, &targets, warning)?);
+            }
+            if handled.iter().any(|h| !h.is_empty()) {
+                // Copies the same sheets took are cut from the rest at once.
+                let mut groups: Vec<(Vec<String>, Vec<Traced>)> = Vec::new();
+                let mut rest = copies.into_iter();
+                for (done, instance) in handled.into_iter().zip(&instances) {
+                    let tools: Vec<Traced> = rest.by_ref().take(instance.len()).collect();
+                    match groups.iter_mut().find(|(d, _)| *d == done) {
+                        Some((_, all)) => all.extend(tools),
+                        None => groups.push((done, tools)),
+                    }
+                }
+                for (done, tools) in groups {
+                    apply_beside_sheet_cut(doc, st, f, tools, op, &targets, &done)?;
+                }
+                continue;
             }
         }
         // New bodies from a pattern join their source when they touch it (as one feature would).
