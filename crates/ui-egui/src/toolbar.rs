@@ -898,8 +898,9 @@ fn ribbon_text(ui: &egui::Ui, at: egui::Pos2, text: &str, size: f32, color: Colo
 }
 
 /// SKETCH while editing a sketch and SHEET METAL while a sheet body is active take the contextual
-/// tab style; SHEET METAL is an ordinary tab otherwise.
-fn contextual_tab(app: &SolveApp, tab: &str) -> bool {
+/// tab style; SHEET METAL is an ordinary tab otherwise. WELDMENTS selects itself on a frame member
+/// but keeps the ordinary tab look, as MODEL has when selected.
+pub(crate) fn contextual_tab(app: &SolveApp, tab: &str) -> bool {
     tab == "SKETCH" || (tab == "SHEET METAL" && crate::workspace::sheet_body(app).is_some())
 }
 
@@ -2094,7 +2095,7 @@ pub fn shortcuts(app: &mut SolveApp, ctx: &egui::Context) {
                     crate::select_other::close(app);
                 } else if app.tool.is_some() {
                     crate::tools::finish(app);
-                } else if app.dialog.is_some() {
+                } else if app.dialog.is_some() || app.pending_feature_edit.is_some() {
                     crate::dialogs::cancel(app);
                 } else if !app.session.selection.is_empty() || app.session.active_sketch.is_none() {
                     app.tree.picked_joints.clear();

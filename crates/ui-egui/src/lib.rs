@@ -57,6 +57,7 @@ pub mod documents;
 pub mod drag_extrude;
 pub mod drag_snap;
 pub mod edit_clipboard;
+mod feature_edit;
 #[cfg(test)]
 mod font_literals_tests;
 pub mod fonts;
@@ -107,6 +108,7 @@ mod measurement_ui_tests;
 mod menu_tests;
 pub(crate) mod mesh_lod;
 pub mod messages;
+pub(crate) mod motion;
 pub mod occurrence_drag;
 #[cfg(test)]
 mod pattern_arrow_tests;
@@ -180,6 +182,7 @@ pub mod open_elsewhere;
 pub(crate) mod open_meshing;
 pub mod params_dialog;
 pub(crate) mod pick_index;
+pub(crate) mod place_gizmo;
 pub(crate) mod plugins;
 pub mod prefs;
 pub mod prefs_notice;
@@ -195,6 +198,8 @@ pub mod render_workspace;
 mod revolve_edit_tests;
 #[cfg(test)]
 mod revolve_manipulator_tests;
+#[cfg(test)]
+mod round_pick_tests;
 mod rule_editor;
 #[cfg(test)]
 mod rule_editor_tests;
@@ -302,6 +307,7 @@ pub struct UiState {
     pub show_browser: bool,
     pub show_timeline: bool,
     pub show_grid: bool,
+    pub show_navigation_bar: bool,
     pub perspective: bool,
     /// Perspective while orbiting, orthographic when the camera faces a standard axis view
     /// (#2682). Off by default; when on it decides the projection instead of `perspective`.
@@ -336,6 +342,7 @@ impl Default for UiState {
             show_browser: true,
             show_timeline: true,
             show_grid: true,
+            show_navigation_bar: true,
             perspective: false,
             auto_ortho_faces: false,
             palette_open: false,
@@ -457,6 +464,8 @@ pub struct SolveApp {
     pub preview: preview::PreviewState,
     /// OK pressed on a feature that takes a while: its evaluation runs off the window thread.
     pub applying: Option<dialogs::Applying>,
+    pub(crate) editing_state: Option<dialogs::EditingState>,
+    pub(crate) pending_feature_edit: Option<feature_edit::PendingFeatureEdit>,
     /// A command recomputing the history (the marker moved, undo) computing off the window
     /// thread, and those asked for meanwhile ([`deferred`]).
     pub deferred: Option<deferred::Deferred>,
@@ -632,6 +641,8 @@ impl SolveApp {
             slicer_menu: dialogs_save_mesh::SlicerMenu::default(),
             preview: preview::PreviewState::default(),
             applying: None,
+            editing_state: None,
+            pending_feature_edit: None,
             deferred: None,
             deferred_queue: Vec::new(),
             start_after_roll: None,
@@ -790,6 +801,7 @@ impl SolveApp {
         json!({
             "dark": self.ui.dark,
             "grid": self.ui.show_grid,
+            "navigation_bar": self.ui.show_navigation_bar,
             "perspective": self.ui.perspective,
             "auto_ortho_faces": self.ui.auto_ortho_faces,
             "pick_bodies": self.ui.pick_bodies,
@@ -825,6 +837,9 @@ impl SolveApp {
         }
         if let Some(g) = flag("grid") {
             self.ui.show_grid = g;
+        }
+        if let Some(visible) = flag("navigation_bar") {
+            self.ui.show_navigation_bar = visible;
         }
         if let Some(p) = flag("perspective") {
             self.ui.perspective = p;
@@ -900,7 +915,38 @@ impl SolveApp {
         let t0 = now_ms();
         let r = self.session.execute(id, &params).map_err(|e| e.to_string());
         self.big_operation |= now_ms() - t0 >= recovery_ui::BIG_OPERATION_MS;
+        self.command_completed(id, r)
+    }
+
+    /// Host effects shared by directly executed and already evaluated commands.
+    pub(crate) fn command_completed(&mut self, id: &str, r: Result<Value, String>) -> Result<Value, String> {
         if let Ok(v) = &r {
+            match id {
+                "view.fit" | "view.home" => self.frame_view(id == "view.home"),
+                "view.tool" => {
+                    self.viewport.nav = match v.get("tool").and_then(Value::as_str) {
+                        Some("orbit") => Some(viewport::NavMode::Orbit),
+                        Some("pan") => Some(viewport::NavMode::Pan),
+                        Some("zoom") => Some(viewport::NavMode::Zoom),
+                        _ => None,
+                    };
+                }
+                "view.spin" => {
+                    self.cancel_view_animation();
+                    self.viewport.spin = v.get("on").and_then(Value::as_bool).unwrap_or(!self.viewport.spin);
+                }
+                "view.visual_style" => {
+                    if let Some(index) = v.get("index").and_then(Value::as_u64).and_then(|n| u8::try_from(n).ok()) {
+                        self.ui.visual_style = index;
+                    }
+                }
+                "view.grid" => self.ui.show_grid = v.get("on").and_then(Value::as_bool).unwrap_or(!self.ui.show_grid),
+                "view.ground_shadow" => self.ui.ground_shadow = v.get("on").and_then(Value::as_bool).unwrap_or(!self.ui.ground_shadow),
+                "view.navigation_bar" => {
+                    self.ui.show_navigation_bar = v.get("visible").and_then(Value::as_bool).unwrap_or(!self.ui.show_navigation_bar)
+                }
+                _ => {}
+            }
             if id == "view.layout" {
                 let layout =
                     if v.get("mode").and_then(Value::as_str) == Some("compact") { shell::LayoutMode::Docked } else { shell::LayoutMode::Floating };
@@ -998,6 +1044,9 @@ impl SolveApp {
                     // The old document is already replaced: discard its editor without
                     // applying cancellation hooks (such as restoring its timeline marker).
                     self.dialog = None;
+                    self.applying = None;
+                    self.editing_state = None;
+                    self.pending_feature_edit = None;
                     self.tool = None;
                     self.preview.reset();
                     self.cam = Camera::default();
@@ -1110,6 +1159,10 @@ impl SolveApp {
             return;
         }
         // A display toggle leaves the current modelling tool and camera in place.
+        if matches!(id, "view.fit" | "view.home" | "view.spin" | "view.grid" | "view.ground_shadow" | "view.navigation_bar") {
+            let _ = self.run(id, json!({}));
+            return;
+        }
         if id == "view.layout" {
             let mode = if self.ui.layout == shell::LayoutMode::Floating { "compact" } else { "floating" };
             let _ = self.run(id, json!({"mode":mode}));
@@ -1223,6 +1276,10 @@ impl SolveApp {
         }
         // Press Pull: edges get a fillet, curved faces an offset, planar faces and profiles an extrude.
         if id == "solid.press_pull" {
+            if let Some(pending) = &mut self.pending_feature_edit {
+                pending.then_start(id);
+                return;
+            }
             let sel = &self.session.selection;
             let edges = sel.iter().any(|s| matches!(s, solidcraft_engine::Sel::Edge { .. }));
             let curved = sel.iter().any(
@@ -1244,6 +1301,15 @@ impl SolveApp {
                 d.press_pull = true;
             }
             return;
+        }
+        let interactive = self.interactive(id);
+        if interactive && let Some(pending) = &mut self.pending_feature_edit {
+            pending.then_start(id);
+            return;
+        }
+        // Cancel before finishing a sketch or waiting for its history marker.
+        if interactive && (self.editing_state.is_some() || self.applying.is_some()) {
+            dialogs::cancel(self);
         }
         let finished_sketch = self.session.active_sketch.filter(|_| ends_sketch(id) && self.interactive(id));
         if finished_sketch.is_some() {
@@ -1350,6 +1416,7 @@ impl SolveApp {
     /// timeline back to just before themselves and reopen their dialog, filled in.
     pub fn edit_feature(&mut self, id: u64) {
         use solidcraft_engine::doc::FeatureKind;
+        dialogs::cancel(self);
         let Some(f) = self.session.doc.feature(id) else { return };
         if matches!(f.kind, FeatureKind::Sketch { .. }) {
             self.edit_sketch(id);
@@ -1358,14 +1425,28 @@ impl SolveApp {
         let Some(idx) = self.session.doc.feature_index(id) else { return };
         let marker = self.finish_sketch_for_edit();
         self.tool = None;
+        if self.session.doc.marker != marker {
+            self.prepare_feature_edit(id, idx, marker);
+            return;
+        }
+        let original = self.session.scratch();
         if dialogs::roll_marker(self, Some(idx)).is_err() {
             return;
         }
+        self.open_feature_edit(id, marker, original);
+    }
+
+    fn open_feature_edit(&mut self, id: u64, marker: Option<usize>, original: Session) {
+        self.editing_state = Some(dialogs::EditingState { source: self.session.scratch(), original });
         match dialogs::for_feature(self, id, marker) {
-            Some(d) => self.dialog = Some(d),
+            Some(d) => {
+                if !d.previews() {
+                    self.editing_state = None;
+                }
+                self.dialog = Some(d);
+            }
             None => {
-                let _ = dialogs::roll_marker(self, marker);
-                // No dialog for this feature: open the search box with the command to edit it.
+                dialogs::restore_editing(self, marker);
                 self.sbox.text = format!("timeline.edit {{\"feature\": {id}, \"set\": {{}}}}");
                 self.ui.palette_open = true;
             }
@@ -1405,7 +1486,11 @@ impl SolveApp {
     /// Pass the original marker to the next editor. Restoring it between editors could finish
     /// in the background after the next rollback, moving the marker out from under that edit.
     fn finish_sketch_for_edit(&mut self) -> Option<usize> {
-        let marker = self.pre_sketch_marker.take().unwrap_or(self.session.doc.marker);
+        let marker = self
+            .pending_feature_edit
+            .take()
+            .map(|pending| pending.marker)
+            .unwrap_or_else(|| self.pre_sketch_marker.take().unwrap_or(self.session.doc.marker));
         if self.session.active_sketch.is_some() {
             self.finish_sketch();
         }
@@ -1677,17 +1762,29 @@ impl SolveApp {
 
     /// Animated view changes for the axis view and navigation bar.
     pub fn animate_view(&mut self, v: &str) {
-        if render_workspace::result_active(self) && matches!(v, "fit" | "home") {
+        if matches!(v, "fit" | "home") {
+            let _ = self.run(if v == "fit" { "view.fit" } else { "view.home" }, json!({}));
+        } else if let Some(view) = StandardView::parse(v) {
+            self.pending_fit = None;
+            let mut to = self.cam;
+            to.set_view(view);
+            self.animate_to(to);
+        }
+    }
+
+    /// Apply view.fit / view.home to the active canvas, retaining each canvas's framing policy.
+    fn frame_view(&mut self, home: bool) {
+        if render_workspace::result_active(self) {
             render_workspace::fit_result(self);
             return;
         }
         // The flat pattern is a 2D view: Fit and Home frame it, and the Design camera stays put.
-        if dialogs_sheet::flat_active(self) && matches!(v, "fit" | "home") {
+        if dialogs_sheet::flat_active(self) {
             self.flat_view.fitted = false;
             return;
         }
-        if render_workspace::active(self) && matches!(v, "fit" | "home") {
-            if v == "home" {
+        if render_workspace::active(self) {
+            if home {
                 self.cam.set_view(StandardView::Iso);
             }
             self.fit_view();
@@ -1695,27 +1792,22 @@ impl SolveApp {
         }
         self.pending_fit = None;
         let mut to = self.cam;
-        match v {
+        if home {
+            to.set_view(StandardView::Iso);
+            self.pending_fit = Some((to, viewport::view_bounds(self), true));
+            to = self.fitted(to);
+        } else {
             // With something selected, Fit frames the selection.
-            "fit" => match viewport::selection_bounds(self) {
-                Some(b) => {
-                    self.pending_fit = Some((to, b, true));
-                    to = self.fitted_bounds(to, &b);
+            match viewport::selection_bounds(self) {
+                Some(bounds) => {
+                    self.pending_fit = Some((to, bounds, true));
+                    to = self.fitted_bounds(to, &bounds);
                 }
                 None => {
                     self.pending_fit = Some((to, viewport::view_bounds(self), true));
                     to = self.fitted(to);
                 }
-            },
-            "home" => {
-                to.set_view(StandardView::Iso);
-                self.pending_fit = Some((to, viewport::view_bounds(self), true));
-                to = self.fitted(to);
             }
-            v => match StandardView::parse(v) {
-                Some(sv) => to.set_view(sv),
-                None => return,
-            },
         }
         let request = self.pending_fit.take();
         self.animate_to(to);
@@ -1931,6 +2023,7 @@ impl SolveApp {
         }
         self.ui.layout.publish(ui.ctx());
         scenario::clear_handles();
+        self.poll_feature_edit(ui.ctx());
         self.poll_deferred(ui.ctx());
         self.poll_delete_check(ui.ctx());
         if !self.embedded {

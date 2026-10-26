@@ -348,6 +348,8 @@ pub struct ThreadInfo {
     pub radius: f64,
     pub pitch: f64,
     pub internal: bool,
+    #[serde(default)]
+    pub handedness: crate::ThreadHandedness,
     pub axis_point: Vec3,
     pub axis: UnitVec3,
     /// Threaded part along the axis from `axis_point`.
@@ -422,13 +424,21 @@ pub(crate) fn format_thread(d: f64, p: f64) -> String {
 /// The automatic ISO metric designation for a cylindrical face, using the same fit check as
 /// a thread feature without an explicit size. This query does not change the model.
 pub fn suggested_thread(st: &ModelState, p: Vec3) -> Result<String> {
-    thread_on(st, 0, p, None, None, false).map(|t| t.designation)
+    thread_on(st, 0, p, None, None, false, crate::ThreadHandedness::Right).map(|t| t.designation)
 }
 
 /// A cosmetic thread on the cylindrical face at `p`. A `turned` (modelled) thread also fits a
 /// shaft thicker than it, which it turns down to its major diameter first.
-fn thread_on(st: &ModelState, feature: u64, p: Vec3, designation: Option<&str>, length: Option<f64>, turned: bool) -> Result<ThreadInfo> {
-    thread_on_impl(st, feature, p, designation, length, false, turned)
+fn thread_on(
+    st: &ModelState,
+    feature: u64,
+    p: Vec3,
+    designation: Option<&str>,
+    length: Option<f64>,
+    turned: bool,
+    handedness: crate::ThreadHandedness,
+) -> Result<ThreadInfo> {
+    thread_on_impl(st, feature, p, designation, length, false, turned, handedness)
 }
 
 // Tapped holes admit verified Unified and parallel pipe sizes; the separate Thread feature remains metric,
@@ -441,6 +451,7 @@ fn thread_on_impl(
     length: Option<f64>,
     tapped: bool,
     turned: bool,
+    handedness: crate::ThreadHandedness,
 ) -> Result<ThreadInfo> {
     let (body, cyl) = st
         .bodies
@@ -501,6 +512,7 @@ fn thread_on_impl(
         radius: cyl.radius,
         pitch,
         internal: cyl.internal,
+        handedness,
         axis_point: cyl.axis_point,
         axis: cyl.axis,
         start: a,
@@ -591,7 +603,59 @@ fn thread_groove(t: &ThreadInfo, radius: f64, open: (bool, bool)) -> Result<soli
     if !stations.is_finite() || stations > 720.0 {
         return Err(DocError::Invalid("the modelled thread is too fine for this diameter; use a cosmetic thread".into()));
     }
-    Ok(kernel::sweep_helix_mesh(&plane, &section, base, *k, p, (s1 - s0) / p, stations as usize)?)
+    // The kernel rotates positively about its sweep axis. Reversing both that axis and the
+    // pitch mirrors the angular motion while the lift stays +k * p per turn. The physical
+    // axis, start/end, radial profile and station count remain exactly as for a right thread.
+    let (sweep_axis, sweep_pitch) = match t.handedness {
+        crate::ThreadHandedness::Right => (*k, p),
+        crate::ThreadHandedness::Left => (-*k, -p),
+    };
+    Ok(kernel::sweep_helix_mesh(&plane, &section, base, sweep_axis, sweep_pitch, (s1 - s0) / p, stations as usize)?)
+}
+
+#[cfg(test)]
+mod thread_handedness_tests {
+    use super::*;
+
+    #[test]
+    fn thread_handedness_groove_reflects_exactly_about_the_physical_axis() {
+        for direction in [Vec3::Z, Vec3::X, Vec3::new(1.0, 2.0, 3.0)] {
+            for internal in [false, true] {
+                let axis = UnitVec3::new(direction).unwrap();
+                let radius = if internal { 2.5 } else { 3.0 };
+                let mut info = ThreadInfo {
+                    feature: 1,
+                    body: "Stock".into(),
+                    designation: "M6x1".into(),
+                    major_diameter: 6.0,
+                    radius,
+                    pitch: 1.0,
+                    internal,
+                    handedness: crate::ThreadHandedness::Right,
+                    axis_point: Vec3::new(7.0, -5.0, 2.0),
+                    axis,
+                    start: 1.3,
+                    end: 4.3,
+                };
+                let right = thread_groove(&info, radius, (false, true)).unwrap();
+                info.handedness = crate::ThreadHandedness::Left;
+                let left = thread_groove(&info, radius, (false, true)).unwrap();
+                // Reflection in the radial plane of the initial profile, independent of the
+                // helix parameterization: the projected coordinate along the axis stays fixed.
+                let seed = if axis.x.abs() < 0.9 { Vec3::X } else { Vec3::Y };
+                let normal = (seed - *axis * axis.dot(seed)).normalized().unwrap();
+                assert_eq!(right.positions.len(), left.positions.len());
+                for (r, l) in right.positions.iter().zip(&left.positions) {
+                    let expected = *r - normal * (2.0 * (*r - info.axis_point).dot(normal));
+                    assert!((*l - expected).len() < 1e-10, "physical reflection: {direction:?}/{internal}");
+                    assert!(((*r - *l).dot(*axis)).abs() < 1e-10, "axial extent must not change");
+                }
+                let (r, l) = (right.measure(), left.measure());
+                assert!(r.volume > 0.0 && l.volume > 0.0, "outward, watertight sweep");
+                assert!((r.volume - l.volume).abs() < r.volume * 1e-12, "exact tool volume: {r:?}/{l:?}");
+            }
+        }
+    }
 }
 
 /// What a modelled external thread turns off a shaft thicker than its major diameter before it
@@ -1135,8 +1199,8 @@ impl ModelState {
             }
         });
     }
-    /// [`ModelState::warm_meshes`], and every body's display plan at the current display quality
-    /// (what a GPU viewport draws).
+
+    /// Prepare reference meshes and display plans at the current quality for ahead jobs.
     pub fn warm_display(&self) {
         let q = crate::display_quality::current();
         let planned = |b: &ModelBody| b.plan.get(q.index()).is_none_or(|cell| cell.get().is_some());
@@ -1144,6 +1208,19 @@ impl ModelState {
         kernel::for_each_on_threads(&cold, 16, |b| {
             let _ = b.mesh();
             let _ = b.display_plan();
+        });
+    }
+
+    /// Prepare reference picking geometry and the GPU plan/highlight mesh at exactly the
+    /// requested quality. The first viewport frame then consumes initialized caches only.
+    pub fn warm_display_at(&self, quality: crate::display_quality::DisplayQuality, go_on: impl Fn() -> bool + Sync) {
+        kernel::for_each_on_threads(&self.bodies, 16, |body| {
+            if go_on() {
+                let _ = body.mesh();
+            }
+            if go_on() {
+                let _ = body.plan_mesh_at(quality);
+            }
         });
     }
     pub fn sketch(&self, feature: u64) -> Option<&SolvedSketch> {
@@ -2365,7 +2442,7 @@ impl Model {
 
     /// Set every result's fingerprint to `doc`'s, so the next evaluation reuses every result
     /// (after a change that builds nothing differently).
-    fn refingerprint(&mut self, doc: &Document) {
+    pub fn refingerprint(&mut self, doc: &Document) {
         let (vals, _) = evaluation_values(doc);
         let marker = doc.marker.unwrap_or(usize::MAX);
         self.step_digests = StepDigests::of(doc, &self.step_digests);
@@ -2479,6 +2556,11 @@ fn new_name(state: &mut ModelState, f: &Feature, k: usize) -> String {
         && !n.is_empty()
         && state.body(n).is_none()
     {
+        // A pinned `BodyN` counts as handed out, so a design evaluated again from its stored
+        // names ends with the counter it had when the counter numbered them.
+        if let Some(number) = n.strip_prefix("Body").filter(|_| crate::is_counted_body_name(n)).and_then(|d| d.parse::<usize>().ok()) {
+            state.body_counter = state.body_counter.max(number);
+        }
         return n.clone();
     }
     // Bodies past the stored names (a profile added after the feature was made) are numbered
@@ -4077,17 +4159,15 @@ fn blend_body(
     Ok((Traced::step(nb.with_preserved_planar_sources(&mb.body)?, &[&from]), used, tapered))
 }
 
-/// The revolve axis in the sketch's 2D coordinates (a point on it, its direction). `construct`
-/// gives a construction axis, by name, in the sketch's 3D frame.
-pub(crate) fn revolve_axis(ss: &SolvedSketch, axis: &AxisRef, construct: &dyn Fn(&str) -> Result<(Vec3, Vec3)>) -> Result<(Vec2, Vec2)> {
-    let in_plane = |origin: Vec3, dir: Vec3| {
-        let pl = &ss.plane;
-        let d = dir.normalized().ok_or_else(|| DocError::Invalid("revolve axis has no direction".into()))?;
-        if d.dot(pl.normal()).abs() > 1e-9 || pl.height(origin).abs() > 1e-6 {
-            return Err(DocError::Invalid("the revolve axis does not lie in the sketch plane".into()));
-        }
-        Ok((pl.to_local(origin), Vec2::new(d.dot(pl.x), d.dot(pl.y))))
-    };
+/// The revolve axis in the sketch's plane coordinates (a point and a direction). `st` is the model
+/// an axis on an edge or face of it is found in; `construct` gives a construction axis, by name, in
+/// the sketch's 3D frame.
+pub(crate) fn revolve_axis(
+    ss: &SolvedSketch,
+    axis: &AxisRef,
+    st: &ModelState,
+    construct: &dyn Fn(&str) -> Result<(Vec3, Vec3)>,
+) -> Result<(Vec2, Vec2)> {
     match axis {
         AxisRef::SketchLine { curve } => {
             let ci = ss.sketch.curve_index(curve).ok_or_else(|| DocError::Unknown(format!("sketch line `{curve}`")))?;
@@ -4117,12 +4197,36 @@ pub(crate) fn revolve_axis(ss: &SolvedSketch, axis: &AxisRef, construct: &dyn Fn
             }
             Ok((pl.to_local(Vec3::ZERO), Vec2::new(d.dot(pl.x), d.dot(pl.y))))
         }
-        AxisRef::Line { origin, dir } => in_plane(origin.0, dir.0),
+        AxisRef::Line { origin, dir } => line_in_sketch_plane(ss, origin.0, dir.0),
+        AxisRef::Model { geo } => {
+            let (o, d) = crate::construct::model_axis(st, geo)?;
+            line_in_sketch_plane(ss, o, d)
+        }
         AxisRef::Construction { name } => {
-            let (origin, dir) = construct(name)?;
-            in_plane(origin, dir)
+            let (o, d) = construct(name)?;
+            line_in_sketch_plane(ss, o, d)
         }
     }
+}
+
+/// The model a revolve axis is found in: what construction geometry of component `comp` is built
+/// on when the axis is an edge or face of it (only then is it worth placing).
+pub(super) fn axis_state<'a>(doc: &Document, st: &'a ModelState, comp: u64, axis: &AxisRef) -> std::borrow::Cow<'a, ModelState> {
+    match axis {
+        AxisRef::Model { .. } => construction_state(doc, st, comp),
+        _ => std::borrow::Cow::Borrowed(st),
+    }
+}
+
+/// A world line through `origin` along `dir` in the sketch's plane coordinates, or an error when it
+/// does not lie in the sketch plane.
+fn line_in_sketch_plane(ss: &SolvedSketch, origin: Vec3, dir: Vec3) -> Result<(Vec2, Vec2)> {
+    let pl = &ss.plane;
+    let d = dir.normalized().ok_or_else(|| DocError::Invalid("revolve axis has no direction".into()))?;
+    if d.dot(pl.normal()).abs() > 1e-9 || pl.height(origin).abs() > 1e-6 {
+        return Err(DocError::Invalid("the revolve axis does not lie in the sketch plane".into()));
+    }
+    Ok((pl.to_local(origin), Vec2::new(d.dot(pl.x), d.dot(pl.y))))
 }
 
 /// A construction axis `name` of the timeline so far, as evaluated, in the frame of component
@@ -5286,7 +5390,8 @@ fn feature_tools_with_constructor(
                 f.component,
             )?;
             let regions = solidcraft_sketch::merge_regions(&select_profiles(&ss, profiles)?);
-            let (o, d) = revolve_axis(&ss, axis, &|name| construction_axis_in(Some(doc), st, name, f.component))?;
+            let (o, d) =
+                revolve_axis(&ss, axis, &axis_state(doc, st, f.component, axis), &|name| construction_axis_in(Some(doc), st, name, f.component))?;
             // To Object is in this feature's component frame: the model as seen from there.
             let tst = if to.is_some() { state_in_frame(doc, st, f.component) } else { std::borrow::Cow::Borrowed(st) };
             // Where the tool meets its targets is measured where they are shown (#3383).
@@ -5698,9 +5803,17 @@ fn pipe_region(vals: &BTreeMap<String, Value>, r: f64, wall: &Option<crate::Expr
     Ok(Region2 { outer: solidcraft_geom::Loop2::circle(Vec2::ZERO, r), holes })
 }
 
-fn map_wire(wire: &mut solidcraft_sketch::Wire, matrix: &Mat) {
+pub fn map_wire(wire: &mut solidcraft_sketch::Wire, matrix: &Mat) {
     for point in wire.pts.iter_mut().chain(&mut wire.fit) {
         *point = crate::apply_point(matrix, *point);
+    }
+    if let Some(arc) = &mut wire.arc {
+        let normal = crate::apply_vector(matrix, arc.normal);
+        arc.center = crate::apply_point(matrix, arc.center);
+        arc.start = crate::apply_point(matrix, arc.start);
+        arc.end = crate::apply_point(matrix, arc.end);
+        arc.normal = normal.normalized().unwrap_or(arc.normal);
+        arc.radius = arc.center.dist(arc.start);
     }
 }
 
@@ -6100,10 +6213,12 @@ fn pattern_transforms(doc: &Document, vals: &BTreeMap<String, Value>, st: &Model
                 out.push(m);
             }
         }
-        crate::PatternKind::Circular { origin, axis, count: c, angle, alignment, reversed, axis_feature } => {
-            let (origin, axis) = match axis_feature {
-                Some(name) => construction_axis_in(Some(doc), st, name, component)?,
-                None => (origin.0, axis.0),
+        crate::PatternKind::Circular { origin, axis, count: c, angle, alignment, reversed, axis_ref, axis_feature } => {
+            // On an edge or round face: about it as it is now; on a construction axis: where it is.
+            let (origin, axis) = match (axis_ref, axis_feature) {
+                (Some(g), _) => crate::construct::model_axis(&construction_state(doc, st, component), g)?,
+                (None, Some(name)) => construction_axis_in(Some(doc), st, name, component)?,
+                (None, None) => (origin.0, axis.0),
             };
             let n = count(c)?;
             let total = val(vals, angle, Kind::Angle)?;
@@ -6773,11 +6888,12 @@ pub(crate) fn sheet_face_plane_in_frame(doc: &Document, st: &ModelState, comp: u
         PlaneRef::Offset { base, distance } => {
             PlaneRef::Offset { base: Box::new(sheet_face_plane_in_frame(doc, st, comp, base)?), distance: distance.clone() }
         }
-        PlaneRef::AtAngle { base, axis_origin, axis_dir, angle } => PlaneRef::AtAngle {
+        PlaneRef::AtAngle { base, axis_origin, axis_dir, angle, line } => PlaneRef::AtAngle {
             base: Box::new(sheet_face_plane_in_frame(doc, st, comp, base)?),
             axis_origin: *axis_origin,
             axis_dir: *axis_dir,
             angle: angle.clone(),
+            line: line.clone(),
         },
         PlaneRef::Flipped { base, about_y } => {
             PlaneRef::Flipped { base: Box::new(sheet_face_plane_in_frame(doc, st, comp, base)?), about_y: *about_y }
@@ -7002,7 +7118,7 @@ fn eval_feature(doc: &Document, vals: &BTreeMap<String, Value>, f: &Feature, st:
             }
             apply_traced(doc, st, f, tools, *operation, &crate::plain(targets))
         }
-        FeatureKind::Hole { thread, thread_depth, diameter, .. } => {
+        FeatureKind::Hole { thread, thread_depth, diameter, handedness, .. } => {
             let thread_depth = thread_depth.as_ref().map(|d| val(vals, d, Kind::Length)).transpose()?;
             if thread_depth.is_some() && thread.is_none() {
                 return Err(DocError::Invalid("thread depth requires a tapped hole".into()));
@@ -7029,7 +7145,7 @@ fn eval_feature(doc: &Document, vals: &BTreeMap<String, Value>, f: &Feature, st:
                     } else {
                         parallel_tapped_wall(st, p, dir, r).unwrap_or(p + dir.any_perp() * r + dir * (r * 0.5))
                     };
-                    let mut t = thread_on_impl(st, f.id, wall, Some(d), None, true, false)?;
+                    let mut t = thread_on_impl(st, f.id, wall, Some(d), None, true, false, *handedness)?;
                     if let Some(depth) = thread_depth {
                         let available = t.end - t.start;
                         if depth > available {
@@ -7052,12 +7168,12 @@ fn eval_feature(doc: &Document, vals: &BTreeMap<String, Value>, f: &Feature, st:
             }
             Ok(())
         }
-        FeatureKind::Thread { face, designation, length, modeled } => {
+        FeatureKind::Thread { face, designation, length, modeled, handedness } => {
             let l = match length {
                 Some(e) => Some(val(vals, e, Kind::Length)?),
                 None => None,
             };
-            let t = thread_on(st, f.id, face.0, designation.as_deref(), l, *modeled)?;
+            let t = thread_on(st, f.id, face.0, designation.as_deref(), l, *modeled, *handedness)?;
             if !*modeled {
                 st.threads.push(t);
                 return Ok(());
@@ -7770,6 +7886,7 @@ fn construction_state<'a>(doc: &Document, st: &'a ModelState, comp: u64) -> std:
 fn plane_is_fixed(plane: &PlaneRef) -> bool {
     match plane {
         PlaneRef::Origin { .. } | PlaneRef::Custom { .. } | PlaneRef::Placed { .. } => true,
+        PlaneRef::AtAngle { line: Some(_), .. } => false,
         PlaneRef::Offset { base, .. } | PlaneRef::AtAngle { base, .. } | PlaneRef::Flipped { base, .. } => plane_is_fixed(base),
         _ => false,
     }
@@ -7780,6 +7897,7 @@ fn plane_is_fixed(plane: &PlaneRef) -> bool {
 fn plane_reads_geometry(plane: &PlaneRef) -> bool {
     match plane {
         PlaneRef::Origin { .. } | PlaneRef::Custom { .. } | PlaneRef::Placed { .. } | PlaneRef::Construction { .. } => false,
+        PlaneRef::AtAngle { line: Some(_), .. } => true,
         PlaneRef::Offset { base, .. } | PlaneRef::AtAngle { base, .. } | PlaneRef::Flipped { base, .. } => plane_reads_geometry(base),
         PlaneRef::ThroughPoint { .. }
         | PlaneRef::Midplane { .. }
@@ -8263,6 +8381,51 @@ pub fn world_state_reusing(doc: &Document, st: &ModelState, placed_before: &mut 
     }
     *placed_before = placed_now;
     out
+}
+
+#[cfg(test)]
+mod display_preparation_tests {
+    use super::*;
+
+    fn state() -> ModelState {
+        let body = kernel::box_solid(Vec3::ZERO, Vec3::new(2.0, 3.0, 4.0)).unwrap();
+        ModelState { bodies: vec![ModelBody::new("Box".into(), body, 1)], ..Default::default() }
+    }
+
+    #[test]
+    fn prepared_display_reads_all_three_caches_without_cold_geometry_or_quality_changes() {
+        use crate::display_quality::{DisplayQuality, current};
+        let state = state();
+        let body = &state.bodies[0];
+        let quality = DisplayQuality::Fine;
+        let index = quality.index();
+        let current = current();
+        let tolerance = body.display_tol();
+        assert!(body.mesh.get().is_none() && body.plan[index].get().is_none() && body.plan_mesh[index].get().is_none());
+        state.warm_display_at(quality, || true);
+        // Inspect the caches before invoking any consumer that could initialize them.
+        let reference = body.mesh.get().unwrap();
+        let plan = body.plan[index].get().unwrap().as_ref().unwrap();
+        let display = body.plan_mesh[index].get().unwrap().as_ref().unwrap();
+        assert!(Arc::ptr_eq(reference, &body.mesh()));
+        assert!(Arc::ptr_eq(plan, &body.display_plan_at(quality).unwrap()));
+        assert!(Arc::ptr_eq(display, &body.plan_mesh_at(quality).unwrap()));
+        assert_eq!(crate::display_quality::current(), current);
+        assert_eq!(body.display_tol(), tolerance);
+        for other in DisplayQuality::ALL.into_iter().filter(|other| *other != quality) {
+            assert!(body.plan[other.index()].get().is_none() && body.plan_mesh[other.index()].get().is_none());
+        }
+    }
+
+    #[test]
+    fn cancelled_display_preparation_leaves_cold_caches_untouched() {
+        let state = state();
+        state.warm_display_at(crate::display_quality::DisplayQuality::Normal, || false);
+        let body = &state.bodies[0];
+        assert!(body.mesh.get().is_none());
+        assert!(body.plan.iter().all(|slot| slot.get().is_none()));
+        assert!(body.plan_mesh.iter().all(|slot| slot.get().is_none()));
+    }
 }
 
 #[cfg(test)]

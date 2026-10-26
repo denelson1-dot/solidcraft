@@ -612,6 +612,10 @@ preference_settings! {
     hole_moves: bool = false, PAGE_DESIGN => check("Move holes by clicking or dragging");
     /// The browser's Origin folder starts hidden in designs that don't keep its eye themselves.
     hide_origin: bool = false, PAGE_DESIGN => check_tr("ui.hide_origin_by_default");
+    /// Handles on the preview of a feature placed on a face (Rest, Boss, Snap Fit): a marker that
+    /// drags it across the model and a ring that turns it. Off by default: the feature is then placed
+    /// by its click only, as before, and its Position input takes faces only.
+    placement_handles: bool = false, PAGE_DESIGN => check("Placement handles", "Handles on the preview of a Rest, Boss or Snap Fit: drag the marker to move it across the model, turn it by its ring");
     /// What a middle-button double-click in the view does: `home`, `fit` or `off`.
     middle_double_click: String = "home".into(), PAGE_NAVIGATION;
     /// Colour vision mode (#778): `off`, `protan`, `deutan` or `tritan`.
@@ -751,6 +755,7 @@ struct Snapshot {
     dark: bool,
     layout: crate::shell::LayoutMode,
     grid: bool,
+    navigation_bar: bool,
     shadow: bool,
     perspective: bool,
     style: u8,
@@ -768,6 +773,7 @@ impl Snapshot {
             dark: app.ui.dark,
             layout: app.ui.layout,
             grid: app.ui.show_grid,
+            navigation_bar: app.ui.show_navigation_bar,
             shadow: app.ui.ground_shadow,
             perspective: app.ui.perspective,
             style: app.ui.visual_style,
@@ -791,6 +797,7 @@ impl Snapshot {
         app.ui.dark = self.dark;
         app.ui.layout = self.layout;
         app.ui.show_grid = self.grid;
+        app.ui.show_navigation_bar = self.navigation_bar;
         app.ui.ground_shadow = self.shadow;
         app.ui.perspective = self.perspective;
         app.ui.visual_style = self.style;
@@ -969,6 +976,7 @@ fn defaults(app: &mut SolveApp, page: usize) {
         PAGE_INTERFACE => {
             app.ui.dark = true;
             app.ui.layout = app.preferences.layout;
+            app.ui.show_navigation_bar = true;
         }
         PAGE_AI => app.ui.agent_cursor = Default::default(),
         PAGE_NAVIGATION | PAGE_DESIGN => {}

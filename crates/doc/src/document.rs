@@ -15,6 +15,21 @@ pub const MAX_PARAMS: usize = 10_000;
 /// numbers, and far from overflowing the next id.
 pub const MAX_FEATURE_ID: u64 = 1 << 52;
 
+/// Screw direction independent of the cylinder's placement and the picked end.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, solidcraft_derive::Walk)]
+#[serde(rename_all = "lowercase")]
+pub enum ThreadHandedness {
+    #[default]
+    Right,
+    Left,
+}
+
+impl ThreadHandedness {
+    pub fn is_right(&self) -> bool {
+        *self == Self::Right
+    }
+}
+
 /// A named parameter. User parameters are created by the user; model parameters (`d1`, `d2`…)
 /// are created by dimensions and features.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -57,8 +72,17 @@ pub enum PlaneRef {
     /// Another plane moved along its normal until it goes through a point (a vertex, sketch
     /// point or construction point), so it follows the point.
     ThroughPoint { base: Box<PlaneRef>, point: Box<GeoRef> },
-    /// Another plane rotated about a line (in world coordinates) by an angle expression.
-    AtAngle { base: Box<PlaneRef>, axis_origin: Vec3, axis_dir: Vec3, angle: Expr },
+    /// Another plane rotated about a line (in world coordinates) by an angle expression. With
+    /// `line`, an edge or round face of the model ([`crate::construct::model_axis`]), the line is
+    /// found there on each evaluation and `axis_origin`/`axis_dir` are where it was when picked.
+    AtAngle {
+        base: Box<PlaneRef>,
+        axis_origin: Vec3,
+        axis_dir: Vec3,
+        angle: Expr,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        line: Option<Box<GeoRef>>,
+    },
     /// A construction plane feature (by name).
     Construction { name: FeatureName },
     /// `base` seen from its other side: the normal reversed by a half turn about the base's
@@ -394,6 +418,9 @@ pub enum AxisRef {
     World { axis: String },
     /// Any line in the sketch plane, in world coordinates.
     Line { origin: Position, dir: Dir },
+    /// An edge or round face of the model (a straight or circular edge, a cylinder, cone or
+    /// torus face), found again on each evaluation: [`crate::construct::model_axis`].
+    Model { geo: GeoRef },
     /// A construction axis feature, by name, where it is when the revolve is evaluated.
     Construction { name: FeatureName },
 }
@@ -752,6 +779,9 @@ pub enum FeatureKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[walk(length = "Thread depth")]
         thread_depth: Option<Expr>,
+        /// Screw direction of the cosmetic thread; older holes are right-handed.
+        #[serde(default, skip_serializing_if = "ThreadHandedness::is_right")]
+        handedness: ThreadHandedness,
         /// To Object: drill down to the face (or point) here instead of `depth`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         to: Option<FacePick>,
@@ -774,6 +804,8 @@ pub enum FeatureKind {
         length: Option<Expr>,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         modeled: bool,
+        #[serde(default, skip_serializing_if = "ThreadHandedness::is_right")]
+        handedness: ThreadHandedness,
     },
     /// Ruled loft through profiles of several sketches, in order.
     Loft {
@@ -2152,6 +2184,11 @@ pub enum PatternKind {
         alignment: solidcraft_sketch::PatternAlignment,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         reversed: bool,
+        /// The edge or round face of the model the copies turn about, found again on each
+        /// evaluation ([`crate::construct::model_axis`]); `origin` and `axis` are where it was
+        /// when picked.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        axis_ref: Option<GeoRef>,
         /// A construction axis the copies turn about, by name, followed when it moves;
         /// `origin` and `axis` are where it was when the pattern was made.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2563,6 +2600,11 @@ pub struct DesignLink {
     pub feature: u64,
 }
 
+/// A name the design's counter hands out (`Body1`).
+pub fn is_counted_body_name(name: &str) -> bool {
+    name.strip_prefix("Body").is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) && n.parse::<usize>().is_ok())
+}
+
 /// The document.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Document {
@@ -2897,9 +2939,12 @@ impl Document {
     ///
     /// A name the design numbered (`Body1`) is not used again after the rename: the design's
     /// counter starts over at every evaluation, so without this a design that is evaluated
-    /// again hands the freed name to the next body (#4957).
+    /// again hands the freed name to the next body (#4957). Every counted name is reserved as
+    /// soon as a body has it (`Session::pin_body_names`), so this only matters for a design
+    /// that has not been through a command since then. `new` may be a reserved name: a rename
+    /// is deliberate, and the body then has what the design keeps under it.
     pub fn rename_body_keys(&mut self, old: &str, new: &str) {
-        if old.strip_prefix("Body").and_then(|n| n.parse::<usize>().ok()).is_some() {
+        if is_counted_body_name(old) {
             self.reserved_body_names.insert(old.to_string());
         }
         if let Some(m) = self.materials.remove(old) {
@@ -3675,12 +3720,19 @@ impl Document {
                 let b = self.resolve_plane_in(vals, base, depth + 1, st)?;
                 Ok(b.offset(Self::eval_in(vals, distance, Kind::Length)?))
             }
-            PlaneRef::AtAngle { base, axis_origin, axis_dir, angle } => {
+            PlaneRef::AtAngle { base, axis_origin, axis_dir, angle, line } => {
                 let b = self.resolve_plane_in(vals, base, depth + 1, st)?;
                 let a = Self::eval_in(vals, angle, Kind::Angle)?;
+                let (axis_origin, axis_dir) = match line {
+                    Some(g) => {
+                        let st = st.ok_or_else(|| DocError::Invalid("this plane is built from the model: evaluate first".into()))?;
+                        crate::construct::model_axis(st, g)?
+                    }
+                    None => (*axis_origin, *axis_dir),
+                };
                 let d = axis_dir.normalized().ok_or_else(|| DocError::Invalid("rotation axis".into()))?;
                 let rot = |v: Vec3| v * a.cos() + d.cross(v) * a.sin() + d * (d.dot(v) * (1.0 - a.cos()));
-                let o = *axis_origin + rot(b.origin - *axis_origin);
+                let o = axis_origin + rot(b.origin - axis_origin);
                 Plane::new(o, rot(b.x), rot(b.y)).ok_or_else(|| DocError::Invalid("degenerate plane".into()))
             }
             PlaneRef::Flipped { base, about_y } => Ok(self.resolve_plane_in(vals, base, depth + 1, st)?.flipped(*about_y)),
