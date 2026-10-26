@@ -264,6 +264,7 @@ pub mod ui_kit;
 mod ui_kit_guard_tests;
 pub mod update;
 mod value_step;
+mod view_confirm;
 pub mod view_pick;
 pub mod viewport;
 mod viewport_layout;
@@ -918,6 +919,11 @@ impl SolveApp {
                     self.preferences.timeline_collapsed = collapsed;
                 }
             }
+            if id == "view.perspective"
+                && let Some(perspective) = v.get("enabled").and_then(Value::as_bool)
+            {
+                self.ui.perspective = perspective;
+            }
             if matches!(id, "view.ambient_occlusion" | "view.graphics_preset") {
                 self.preferences.ambient_occlusion = v.get("enabled").and_then(Value::as_bool).unwrap_or(false);
                 if id == "view.graphics_preset" {
@@ -1099,6 +1105,10 @@ impl SolveApp {
         }
         if id == "view.ambient_occlusion" {
             let _ = self.run(id, json!({"enabled": !self.preferences.ambient_occlusion}));
+            return;
+        }
+        if id == "view.perspective" {
+            let _ = self.run(id, json!({"enabled": !self.ui.perspective}));
             return;
         }
         // Another command ends Edit Text (its dialog is not a feature edit to keep).
@@ -2002,6 +2012,8 @@ impl SolveApp {
                     self.show_workspace(ui);
                 }
             });
+        // Before the dialog: a click on the view's OK or Cancel is for this frame's dialog.
+        view_confirm::show(self, ui.ctx());
         dialogs::show(self, ui.ctx());
         issue_report::CadInput::block(self, ui, report_input);
         sketch_palette::show(self, ui.ctx());
