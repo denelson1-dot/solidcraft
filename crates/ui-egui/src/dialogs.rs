@@ -1472,6 +1472,17 @@ impl Dialog {
         if !inp.multi && !inp.items.is_empty() && self.active + 1 < self.inputs.len() {
             self.advance();
         }
+        // Move by points or about an axis: once a body is in, go on to the empty From, Point or
+        // Axis (#6170), so the next click picks it instead of another body. Free Move's Pivot is
+        // optional and stays unvisited.
+        if let Kind::Move { mode: crate::dialogs_move::ROTATE | crate::dialogs_move::POINT_TO_POINT | crate::dialogs_move::POINT_TO_POSITION, .. } =
+            self.kind
+            && self.active == 0
+            && self.inputs.first().is_some_and(|i| !i.items.is_empty())
+            && self.inputs.get(1).is_some_and(|i| i.items.is_empty())
+        {
+            self.active = 1;
+        }
         self.error = None;
         self.sync_thread(s);
     }
@@ -2814,6 +2825,7 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
             }
             let body = |ui: &mut egui::Ui| {
                 d.sync_fillet_chain(&app.session);
+                crate::hole_presets::rows(ui, &mut d, &mut app.preferences.hole_presets, &app.session.doc, reset_scroll);
                 let (accepted, fields) = crate::ui_kit::value_fields(ctx, || dense::rows(app, ctx, &mut d, ui));
                 enter |= accepted;
                 value_fields = fields;
@@ -2897,6 +2909,12 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
     } else {
         d.value_focus = ctx.memory(|memory| memory.focused()).filter(|id| value_fields.iter().any(|(field, _)| field == id));
     }
+    let preset_prompt = crate::hole_presets::name_prompt(ctx, &mut d, &mut app.preferences.hole_presets, &app.session.doc);
+    if preset_prompt {
+        enter = false;
+        ok = false;
+        cancel = false;
+    }
     // Keyboard: Enter applies (from a value field, or with nothing focused), Esc cancels.
     let (enter_free, esc) = ctx.input(|i| (i.key_pressed(egui::Key::Enter), i.key_pressed(egui::Key::Escape)));
     let nothing_focused = ctx.memory(|m| m.focused().is_none());
@@ -2906,10 +2924,10 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
         && !matches!(&d.kind, Kind::Motion(k) if k.wide())
         && !matches!(&d.kind, Kind::Material { editor, .. } if editor.editing());
     let report_active = app.issue_report.draft.is_some();
-    if !report_active && enter_applies && app.applying.is_none() && (enter || canvas_enter || (enter_free && nothing_focused)) {
+    if !preset_prompt && !report_active && enter_applies && app.applying.is_none() && (enter || canvas_enter || (enter_free && nothing_focused)) {
         ok = true;
     }
-    if !report_active && esc && !app.esc_handled {
+    if !preset_prompt && !report_active && esc && !app.esc_handled {
         app.esc_handled = true;
         cancel = true;
     }
@@ -3126,6 +3144,14 @@ fn to_object_on(inputs: &[SelInput]) -> bool {
 /// Add or remove the To Object input; the active input moves to it when it is added.
 fn set_to_object(inputs: &mut Vec<SelInput>, active: &mut usize, on: bool) {
     set_object(inputs, active, TO_OBJECT, on);
+}
+
+/// A personal preset remembers the extent mode, never its destination geometry.
+pub(crate) fn preset_to_object(d: &mut Dialog, on: bool) {
+    set_to_object(&mut d.inputs, &mut d.active, on);
+    if let Some(input) = d.inputs.iter_mut().find(|input| input.label == TO_OBJECT) {
+        input.items.clear();
+    }
 }
 
 fn set_object(inputs: &mut Vec<SelInput>, active: &mut usize, label: &'static str, on: bool) {
@@ -4950,7 +4976,7 @@ fn geo_sel(s: &Session, g: &solidcraft_engine::doc::construct::GeoRef) -> Option
 pub(crate) fn plane_sel(s: &Session, pl: &PlaneRef) -> Option<Sel> {
     match pl {
         PlaneRef::Origin { name } => Some(Sel::Plane { name: name.clone() }),
-        PlaneRef::Construction { name } => Some(Sel::Plane { name: name.to_string() }),
+        PlaneRef::Construction { feature } => s.doc.feature(feature.0).map(|f| Sel::Plane { name: f.name.clone() }),
         PlaneRef::Custom { plane } => face_sel(s, plane.origin),
         // The point picked on the face: the plane's origin can lie off the face (#3567).
         PlaneRef::Face { at, .. } => face_sel(s, *at),
@@ -5436,7 +5462,7 @@ pub fn for_feature(app: &SolveApp, id: u64, marker: Option<usize>) -> Option<Dia
         }
         FeatureKind::Mirror { features, plane, bodies, placements, .. } => {
             let mut d = start("solid.mirror")?;
-            let ids: Vec<u64> = features.iter().filter_map(|n| s.doc.find_feature(n).map(|f| f.id)).collect();
+            let ids: Vec<u64> = features.iter().map(|f| f.0).collect();
             // Replay references stay features, including features that created a body.
             let as_features = !features.is_empty();
             if let Some(inp) = d.inputs.get_mut(0) {
@@ -5462,7 +5488,7 @@ pub fn for_feature(app: &SolveApp, id: u64, marker: Option<usize>) -> Option<Dia
             d
         }
         FeatureKind::Pattern { features, pattern, bodies: copied } => {
-            let ids: Vec<u64> = features.iter().filter_map(|n| s.doc.find_feature(n).map(|f| f.id)).collect();
+            let ids: Vec<u64> = features.iter().map(|f| f.0).collect();
             let bodies: Vec<Sel> = if copied.is_empty() {
                 st.bodies.iter().filter(|b| ids.contains(&b.feature)).map(|b| Sel::Body { name: b.name.clone() }).collect()
             } else {

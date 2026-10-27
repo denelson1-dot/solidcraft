@@ -28,6 +28,7 @@ mod native_crash;
 mod native_frame;
 #[cfg(target_os = "macos")]
 mod native_menu;
+mod nav_bridge;
 #[cfg(target_os = "macos")]
 mod open_documents;
 #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
@@ -87,6 +88,8 @@ struct App {
     space_mouse: space_mouse::SpaceMouse,
     #[cfg(target_os = "macos")]
     native_menu: Option<native_menu::NativeMenu>,
+    /// A device's own app moving the view (Preferences › Navigation, off by default).
+    nav_bridge: nav_bridge::NavBridge,
 }
 
 impl eframe::App for App {
@@ -145,6 +148,8 @@ impl eframe::App for App {
         if !self.solve.file_picker_busy() {
             self.space_mouse.tick(&mut self.solve, ctx);
         }
+        // Every frame, so switching the bridge off reaches the reader while a picker is open too.
+        self.nav_bridge.tick(&mut self.solve, ctx);
         if self.solve.quit_requested {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
@@ -351,6 +356,7 @@ fn services(cc: &eframe::CreationContext<'_>) -> Services {
         can_restore: None,
         restore_file: None,
         download_design: None,
+        easyprint_upload: Some(std::sync::Arc::new(easyprint_upload)),
         browser_files: None,
         agent_http: Some(std::sync::Arc::new(agent_http)),
         secrets: Some(std::sync::Arc::new(Keychain)),
@@ -445,6 +451,24 @@ fn agent_http(r: &solidcraft_ui_egui::agent_chat::backend::HttpRequest) -> Resul
     let status = response.status().as_u16();
     let body = response.body_mut().with_config().limit(16 << 20).read_to_vec().map_err(|e| e.to_string())?;
     Ok((status, body))
+}
+
+/// Open with EasyPrint: upload the model to Printables' import endpoint on a worker and answer on
+/// `done` with the address to open. Through [`agent_http`]: no redirects, a timeout, no cookies.
+fn easyprint_upload(name: &str, bytes: Vec<u8>, done: std::sync::mpsc::Sender<Result<String, String>>) {
+    use solidcraft_engine::easyprint;
+    let name = name.to_string();
+    std::thread::spawn(move || {
+        let (content_type, body) = easyprint::multipart(&name, &bytes);
+        let request = solidcraft_ui_egui::agent_chat::backend::HttpRequest {
+            method: "POST",
+            url: easyprint::IMPORT_URL.into(),
+            headers: vec![("Content-Type".into(), content_type), ("Accept".into(), "application/json".into())],
+            body: Some(body),
+            timeout_s: 180,
+        };
+        let _ = done.send(agent_http(&request).and_then(|(status, body)| easyprint::parse_import_response(status, &body)));
+    });
 }
 
 /// API keys in the system keychain (service "SolidCraft agent chat", one entry per agent).
@@ -933,8 +957,9 @@ fn main() -> eframe::Result {
             if !notes.is_empty() {
                 app.set_status(notes.join(" "), true);
             }
+            let nav_bridge = nav_bridge::NavBridge::start(&cc.egui_ctx);
             #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
-            let space_mouse = space_mouse::SpaceMouse::start(&cc.egui_ctx);
+            let space_mouse = space_mouse::SpaceMouse::start(&cc.egui_ctx, nav_bridge.claim());
             #[cfg(target_os = "macos")]
             let native_menu = match native_menu::NativeMenu::new(&app, &cc.egui_ctx) {
                 Ok(menu) => Some(menu),
@@ -959,6 +984,7 @@ fn main() -> eframe::Result {
                 space_mouse,
                 #[cfg(target_os = "macos")]
                 native_menu,
+                nav_bridge,
             }))
         }),
     );

@@ -672,6 +672,10 @@ fn file_menu(app: &mut SolveApp, ctx: &egui::Context) {
                     FileAction::ExportMesh("3mf").run(app);
                     close = true;
                 }
+                if item_if(ui, "Send to Slicer", "", "mesh_export", shown && crate::dialogs_save_mesh::available(app)) {
+                    app.start("file.send_to_slicer");
+                    close = true;
+                }
                 if item_if(ui, "Export STEP…", "", "export", shown) {
                     FileAction::Export("step").run(app);
                     close = true;
@@ -1691,6 +1695,8 @@ fn ribbon_tooltip(app: &SolveApp, response: egui::Response, command: &solidcraft
         let description = match command.id {
             "render.scene" => Some(app.tr("render.preview_help")),
             "render.start" => Some(app.tr("render.image_help")),
+            // Sending again replaces the file the slicer has open.
+            "file.send_to_slicer" => Some(app.tr("ui.slicer_resend_hint")),
             "render.preset.resolve" | "render.preset.apply" => Some(app.tr("render.ribbon_studios_help")),
             "render.library.appearance.apply" | "render.library.surface.bind" => Some(app.tr("render.ribbon_materials_help")),
             "render.library.studio.prepare" | "render.library.studio.apply" => Some(app.tr("render.ribbon_lights_help")),
@@ -1999,7 +2005,12 @@ pub fn shortcuts(app: &mut SolveApp, ctx: &egui::Context) {
     }
     // A dimension value that is taking the keyboard: letters belong to it (a parameter name
     // starting with L or D), even on the frame before its field holds the focus.
-    if egui::Popup::is_any_open(ctx) || ctx.egui_wants_keyboard_input() || crate::dim_view::editing() || crate::dialogs_save_mesh::popup_open(ctx) {
+    if egui::Popup::is_any_open(ctx)
+        || ctx.egui_wants_keyboard_input()
+        || crate::dim_view::editing()
+        || crate::dialogs_save_mesh::popup_open(ctx)
+        || crate::hole_presets::name_prompt_open(ctx, app.dialog.as_ref())
+    {
         return;
     }
     let (keys, mods) = ctx.input(|i| {

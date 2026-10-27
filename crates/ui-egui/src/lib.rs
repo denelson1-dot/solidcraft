@@ -56,6 +56,7 @@ mod dimension_create_ui_tests;
 pub mod documents;
 pub mod drag_extrude;
 pub mod drag_snap;
+pub mod easyprint_ui;
 pub mod edit_clipboard;
 mod feature_edit;
 #[cfg(test)]
@@ -73,6 +74,7 @@ pub(crate) mod hole_place;
 mod hole_place_ui_tests;
 #[cfg(test)]
 mod hole_placement_ui_tests;
+pub mod hole_presets;
 pub(crate) mod hole_refs;
 #[cfg(test)]
 mod hole_refs_ui_tests;
@@ -178,6 +180,7 @@ mod fillet_spline_handle_tests;
 pub mod mouse_gesture;
 pub(crate) mod navigation;
 pub use navigation::WebWheelGestures;
+pub mod network_prompt;
 pub mod open_elsewhere;
 pub(crate) mod open_meshing;
 pub mod params_dialog;
@@ -399,6 +402,9 @@ pub struct Services {
     pub agent_http: Option<agent_chat::backend::HttpFn>,
     /// The system keychain, for API agents' keys; None: keys can't be stored.
     pub secrets: Option<std::sync::Arc<dyn agent_chat::backend::Secrets>>,
+    /// Upload a model to EasyPrint (Printables' slicer in the browser) and answer with the address
+    /// to open (`easyprint_ui`); None: this host can't, and the menu doesn't offer it.
+    pub easyprint_upload: Option<easyprint_ui::Upload>,
 }
 
 /// The view before a sketch opened and the view that faced the sketch then (#7038).
@@ -428,6 +434,10 @@ pub struct SolveApp {
     pub pre_sketch_cam: Option<PreSketchView>,
     pub services: Services,
     file_picker: Option<file_picker::Pending>,
+    /// A slicer started alone and waited for before the file is sent (Send to Slicer).
+    pub(crate) slicer_wait: Option<dialogs_save_mesh::SlicerWait>,
+    /// Open with EasyPrint: the upload in flight and the question before the first one.
+    pub(crate) easyprint: easyprint_ui::State,
     /// A Save or Save As being written on a worker (see [`save_job`]).
     saving: Option<save_job::Saving>,
     pub viewport: viewport::ViewportState,
@@ -511,6 +521,8 @@ pub struct SolveApp {
     pub lock_prompts: Vec<open_elsewhere::LockPrompt>,
     /// A Save waiting for "the file changed on disk" to be answered.
     pub disk_prompt: bool,
+    /// Update Links or Open Linked Design waiting for a network server to be allowed.
+    pub network_prompt: Option<network_prompt::NetworkPrompt>,
     /// Designs left by crashed apps, offered for recovery.
     pub recoverable: Vec<solidcraft_engine::recovery::Entry>,
     /// The bodies of a just-opened Y-up file, offered to be stood up (`stand_up`).
@@ -615,7 +627,9 @@ impl SolveApp {
         }
         let mut render_workspace = render_workspace::State::default();
         render_workspace.image_host = image_host;
-        SolveApp {
+        #[cfg(not(target_arch = "wasm32"))]
+        solidcraft_engine::slicer_files::clean_old();
+        let mut app = SolveApp {
             session,
             ui: UiState::default(),
             shell: Default::default(),
@@ -626,6 +640,8 @@ impl SolveApp {
             pre_sketch_cam: None,
             services,
             file_picker: None,
+            slicer_wait: None,
+            easyprint: Default::default(),
             saving: None,
             viewport: viewport::ViewportState::default(),
             render_workspace,
@@ -672,6 +688,7 @@ impl SolveApp {
             locks: None,
             lock_prompts: Vec::new(),
             disk_prompt: false,
+            network_prompt: None,
             recoverable: Vec::new(),
             stand_up: None,
             stand_up_occurrence: None,
@@ -717,7 +734,9 @@ impl SolveApp {
             applied_fonts_language: "en".into(),
             applied_ui_font: String::new(),
             applied_system_fonts: false,
-        }
+        };
+        easyprint_ui::install(&mut app);
+        app
     }
 
     /// Translate text using the active language preference.
@@ -902,6 +921,8 @@ impl SolveApp {
             self.ui.layout = p.layout;
             self.preferences = p;
         }
+        // Before a design given at start opens: its paths follow the network preferences.
+        prefs::apply_network(&self.preferences);
         // Saved before the theme was a preference: the Dark/Light flag says which.
         if v.get("preferences").and_then(|p| p.get("theme")).is_none() {
             self.preferences.theme = if self.ui.dark { "dark" } else { "light" }.into();
@@ -923,6 +944,10 @@ impl SolveApp {
     pub fn run(&mut self, id: &str, params: Value) -> Result<Value, String> {
         if self.file_load.busy() || self.file_picker.is_some() || self.saving.is_some() {
             return Err("a file operation is in progress".into());
+        }
+        // Commands may start only detected slicers and the programs the user added under Custom….
+        if matches!(id, "file.save_mesh" | "file.send_to_slicer") {
+            solidcraft_engine::slicers::set_chosen_programs(&self.preferences.custom_slicers);
         }
         let t0 = now_ms();
         let r = self.session.execute(id, &params).map_err(|e| e.to_string());
@@ -1188,6 +1213,11 @@ impl SolveApp {
             let _ = self.run(id, json!({"enabled": !self.preferences.ambient_occlusion}));
             return;
         }
+        // Send to Slicer always asks which slicer (the dialog pre-selects the last one).
+        if matches!(id, "file.send_to_slicer" | "file.open_in_easyprint") && !dialogs_save_mesh::available(self) {
+            self.set_status(self.tr("ui.send_to_slicer_unavailable").to_string(), true);
+            return;
+        }
         if id == "view.perspective" {
             let _ = self.run(id, json!({"enabled": !self.ui.perspective}));
             return;
@@ -1220,8 +1250,9 @@ impl SolveApp {
         }
         if id == "component.update_links" && !self.session.doc.links.is_empty() {
             // Reading the linked designs again takes a while in a large assembly: off the window
-            // thread, the overlay naming the one being read (#5329).
-            let _ = file_load::begin_request(self, file_load::Request::new("", file_load::Kind::UpdateLinks));
+            // thread, the overlay naming the one being read (#5329). A link on a network server
+            // not allowed yet asks first.
+            network_prompt::update_links(self);
             return;
         }
         if id == "component.insert_design" {
@@ -1230,7 +1261,10 @@ impl SolveApp {
             self.pick_open(|app, path| {
                 let Some(path) = path else { return };
                 if solidcraft_engine::io::is_design_path(&path) {
-                    if app.run("component.insert_design", json!({ "path": path })).is_ok() {
+                    // Picked in the file dialog: its server is the user's choice.
+                    let hosts: Vec<String> = solidcraft_engine::io::vfs::network_host(&path).into_iter().collect();
+                    let inserted = solidcraft_engine::io::vfs::allowing_hosts(&hosts, || app.run("component.insert_design", json!({ "path": path })));
+                    if inserted.is_ok() {
                         app.fit_view();
                     }
                 } else {
@@ -1899,6 +1933,8 @@ impl SolveApp {
     pub fn logic(&mut self, ctx: &egui::Context) {
         frame_watch::begin(self);
         file_picker::tick(self, ctx);
+        dialogs_save_mesh::tick_wait(self, ctx);
+        easyprint_ui::tick(self, ctx);
         render_workspace::sync_backend(self);
         render_workspace::tick(self, ctx);
         file_load::tick(self, ctx);
@@ -2067,6 +2103,7 @@ impl SolveApp {
         open_meshing::show(self, ui.ctx());
         documents::prompt(self, ui.ctx());
         open_elsewhere::show(self, ui.ctx());
+        network_prompt::show(self, ui.ctx());
         update::show(self, ui.ctx());
         install::show(self, ui.ctx());
         // Settings › AI's Add agent dialog: Settings opens over Home too (#3483).
@@ -2190,6 +2227,7 @@ impl SolveApp {
         context_menu::show(self, ui.ctx());
         mouse_gesture::show(self, ui.ctx());
         delete::show(self, ui.ctx());
+        easyprint_ui::show(self, ui.ctx());
         linked_source::show_copies(self, ui.ctx());
         shortcut_box::show(self, ui.ctx());
         prefs::show(self, ui.ctx());
