@@ -38,6 +38,7 @@ pub mod dialogs_assembly;
 pub mod dialogs_coupling;
 pub mod dialogs_frame;
 mod dialogs_hole;
+pub mod dialogs_insert_drawing;
 pub mod dialogs_library;
 pub mod dialogs_motion;
 pub mod dialogs_move;
@@ -67,6 +68,7 @@ pub mod frame_rate;
 pub mod gizmo;
 pub mod gpu;
 pub mod help;
+pub(crate) mod history_rows;
 #[cfg(test)]
 mod hole_direction_ui_tests;
 pub(crate) mod hole_place;
@@ -89,6 +91,7 @@ mod i18n_ui_tests;
 pub mod icon_svg;
 pub mod icons;
 pub mod inference;
+pub mod insert_handles;
 pub mod install;
 pub mod issue_report;
 pub mod joint_drag;
@@ -505,6 +508,18 @@ pub struct SolveApp {
     pub(crate) apply_gate: Option<std::sync::Arc<std::sync::Mutex<std::sync::mpsc::Receiver<()>>>>,
     /// The last command started interactively (id, label), for Repeat.
     pub last_command: Option<(String, String)>,
+    /// Bodies copied with Copy (by name), pasted into the active component by Paste.
+    pub copied_bodies: Vec<String>,
+    /// Text a copy left for the system clipboard, written on the next frame (so a paste event
+    /// follows: the window system sends one only while the clipboard holds text).
+    pub(crate) clipboard_text: Option<String>,
+    /// Component placements copied with Copy (by path): Paste places new instances of them in
+    /// the active component, Paste New (Ctrl+Shift+V) independent copies.
+    pub copied_placements: Vec<Vec<u64>>,
+    /// Bodies cut with Cut (by name): they stay until Paste moves them into a component.
+    pub cut_bodies: Vec<String>,
+    /// Component placements cut with Cut (by path): they stay until Paste moves them.
+    pub cut_placements: Vec<Vec<u64>>,
     /// Esc was already acted on this frame (by the shortcuts), so later handlers skip it.
     pub esc_handled: bool,
     /// When Esc was last pressed (input time): a second press soon after finishes the sketch.
@@ -679,6 +694,11 @@ impl SolveApp {
             #[cfg(test)]
             apply_gate: None,
             last_command: None,
+            copied_bodies: Vec::new(),
+            clipboard_text: None,
+            copied_placements: Vec::new(),
+            cut_bodies: Vec::new(),
+            cut_placements: Vec::new(),
             esc_handled: false,
             last_escape: None,
             status: None,
@@ -1244,8 +1264,14 @@ impl SolveApp {
         if dialogs_sheet::start_export(self, id) {
             return;
         }
+        // The picked drawing is placed (position and scale, previewed) before OK adds it.
         if let Some(ext) = id.strip_prefix("sketch.insert_").filter(|e| matches!(*e, "dxf" | "svg")) {
-            self.pick_open_command(id, json!({}), &[ext]);
+            let command = id.to_string();
+            self.pick_open_for(&[ext], move |app, path| {
+                if let Some(path) = path {
+                    dialogs_insert_drawing::open(app, &command, path);
+                }
+            });
             return;
         }
         if id == "component.update_links" && !self.session.doc.links.is_empty() {
@@ -1320,21 +1346,28 @@ impl SolveApp {
             self.cancel_sketch();
             return;
         }
-        // Press Pull: edges get a fillet, curved faces an offset, planar faces and profiles an extrude.
+        // Press Pull: edges get a fillet, a fillet's round face reopens its fillet (its size
+        // changes, as `solid.press_pull` does: #1932), other curved faces an offset, planar faces
+        // and profiles an extrude.
         if id == "solid.press_pull" {
             if let Some(pending) = &mut self.pending_feature_edit {
                 pending.then_start(id);
                 return;
             }
-            let sel = &self.session.selection;
-            let edges = sel.iter().any(|s| matches!(s, solidcraft_engine::Sel::Edge { .. }));
-            let curved = sel.iter().any(
-                |s| matches!(s, solidcraft_engine::Sel::Face { body, index, .. } if dialogs::planar_face(&self.session, body, *index).is_none()),
-            );
-            if edges {
+            if self.session.selection.iter().any(|s| matches!(s, solidcraft_engine::Sel::Edge { .. })) {
                 return self.start("solid.fillet");
             }
-            if curved {
+            let sel = &self.session.selection;
+            let curved = sel.iter().find_map(|s| match s {
+                solidcraft_engine::Sel::Face { body, index, .. } if dialogs::planar_face(&self.session, body, *index).is_none() => {
+                    Some((body, *index))
+                }
+                _ => None,
+            });
+            if let Some((body, index)) = curved {
+                if let Some(blend) = dialogs::blend_feature(&self.session, body, index) {
+                    return self.edit_feature(blend);
+                }
                 return self.start("solid.offset_face");
             }
             let empty = sel.is_empty();

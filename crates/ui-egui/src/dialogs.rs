@@ -72,6 +72,7 @@ pub const MODIFIERS: &[ToolModifiers] = &[
     ToolModifiers { tool: "solid.cylinder", scopes: SELECT_ONLY, bindings: &[], audit: Audit::VerifiedNoOp },
     ToolModifiers { tool: "solid.sphere", scopes: SELECT_ONLY, bindings: &[], audit: Audit::VerifiedNoOp },
     ToolModifiers { tool: "solid.torus", scopes: SELECT_ONLY, bindings: &[], audit: Audit::VerifiedNoOp },
+    ToolModifiers { tool: "solid.cone", scopes: SELECT_ONLY, bindings: &[], audit: Audit::VerifiedNoOp },
     ToolModifiers { tool: "solid.coil", scopes: SELECT_ONLY, bindings: &[], audit: Audit::VerifiedNoOp },
     ToolModifiers { tool: "solid.combine", scopes: SELECT_ONLY, bindings: &[], audit: Audit::VerifiedNoOp },
 ];
@@ -361,6 +362,8 @@ crate::dialog_descriptor::dialog_descriptors! {
                 dashed: bool,
                 tolerance: f64,
             },
+            /// Insert SVG / DXF: where the picked drawing goes (`dialogs_insert_drawing`).
+            InsertDrawing(crate::dialogs_insert_drawing::Place),
             /// Plastic features (`dialogs_plastic`).
             Plastic(crate::dialogs_plastic::Pl),
             /// Frame members (`dialogs_frame`).
@@ -919,6 +922,19 @@ impl Dialog {
                 },
                 vec![],
             ),
+            "solid.cone" => Dialog::new(
+                Kind::Primitive {
+                    cmd: "solid.cone",
+                    fields: vec![
+                        ("diameter", length_default(s, "20")),
+                        ("top_diameter", length_default(s, "0")),
+                        ("height", length_default(s, "20")),
+                    ],
+                    operation: 0,
+                    at: None,
+                },
+                vec![],
+            ),
             "solid.coil" => Dialog::new(
                 Kind::Primitive {
                     cmd: "solid.coil",
@@ -1104,7 +1120,7 @@ impl Dialog {
             Kind::SketchModify(k) => return k.previews(),
             Kind::Plastic(k) => return k.previews(),
             Kind::Frame(_) => return true,
-            Kind::Part(_) | Kind::PartSize(_) => return true,
+            Kind::Part(_) | Kind::PartSize(_) | Kind::InsertDrawing(_) => return true,
             // Web previews run synchronously; a modelled thread can take seconds.
             Kind::Thread { .. } => return !cfg!(target_arch = "wasm32") && self.extra.get("modeled").and_then(Value::as_bool).unwrap_or(false),
             _ => {}
@@ -1898,6 +1914,17 @@ pub fn planar_face(s: &Session, body: &str, face: usize) -> Option<(Vec3, Vec3)>
     found
 }
 
+/// The fillet or chamfer feature whose blend a body face is (a piece or copy of one too).
+pub fn blend_feature(s: &Session, body: &str, face: usize) -> Option<u64> {
+    use solidcraft_engine::doc::persistent_name;
+    let st = s.world_state();
+    let b = st.body(body)?;
+    let names = solidcraft_engine::doc::naming::face_names(b);
+    let name = names.get(face).filter(|n| persistent_name::is_blend(n))?;
+    let f = s.doc.feature(persistent_name::made_by(name)?)?;
+    matches!(f.kind, FeatureKind::Fillet { .. } | FeatureKind::Chamfer { .. }).then_some(f.id)
+}
+
 thread_local! {
     /// The planar faces looked up last, with the model state they were found in (kept, so the
     /// pointer stays its own). Each lookup tessellates the whole body, about 0.1 s for an
@@ -1985,6 +2012,7 @@ fn title(k: &Kind) -> &'static str {
             "solid.cylinder" => "CYLINDER",
             "solid.sphere" => "SPHERE",
             "solid.coil" => "COIL",
+            "solid.cone" => "CONE",
             _ => "TORUS",
         },
         Kind::Combine { .. } => "COMBINE",
@@ -1996,6 +2024,7 @@ fn title(k: &Kind) -> &'static str {
         Kind::Surface(k) => k.title(),
         Kind::SaveMesh(_) => "SAVE AS MESH",
         Kind::ViewDxf { .. } => "Export Current View as DXF",
+        Kind::InsertDrawing(p) => crate::dialogs_insert_drawing::title(p),
         Kind::Plastic(k) => k.title(),
         Kind::Frame(_) => "FRAME MEMBER",
         Kind::Appearance(_) => "APPEARANCE",
@@ -4367,7 +4396,7 @@ fn dialog_commands(app: &SolveApp, d: &Dialog) -> Result<Vec<(String, Value)>, S
                     "solid.box" => {
                         p.insert("corner".into(), box_corner(s, fields, point, normal));
                     }
-                    "solid.cylinder" | "solid.coil" => {
+                    "solid.cylinder" | "solid.coil" | "solid.cone" => {
                         p.insert("base".into(), pt(point));
                         if let Some(n) = normal {
                             p.insert("axis".into(), pt(n));
@@ -4412,6 +4441,7 @@ fn dialog_commands(app: &SolveApp, d: &Dialog) -> Result<Vec<(String, Value)>, S
         Kind::SketchModify(k) => return crate::sketch_modify_ui::commands(app, k, &d.inputs, &d.extra),
         Kind::SaveMesh(k) => return crate::dialogs_save_mesh::commands(k, &d.inputs),
         Kind::ViewDxf { .. } => return Ok(Vec::new()),
+        Kind::InsertDrawing(p) => return crate::dialogs_insert_drawing::commands(p),
         Kind::Plastic(k) => return crate::dialogs_plastic::commands(app, k, &d.inputs, &d.extra),
         Kind::Frame(k) => return crate::dialogs_frame::commands(app, k, &d.inputs, &d.extra),
         Kind::Appearance(k) => return Ok(crate::dialogs_appearance::commands(k, &d.inputs)),
@@ -5426,6 +5456,22 @@ pub fn for_feature(app: &SolveApp, id: u64, marker: Option<usize>) -> Option<Dia
             if !targets.is_empty() {
                 d.extra.insert("targets".into(), json!(targets));
             }
+            d
+        }
+        FeatureKind::Cone { base, axis, radius, top_radius, height, operation } => {
+            let mut d = start("solid.cone")?;
+            d.kind = Kind::Primitive {
+                cmd: "solid.cone",
+                fields: vec![
+                    ("radius", stored_length(s, radius)),
+                    ("top_radius", stored_length(s, top_radius)),
+                    ("height", stored_length(s, height)),
+                ],
+                operation: op_index(operation),
+                at: None,
+            };
+            d.extra.insert("base".into(), pt_expr(base));
+            d.extra.insert("axis".into(), pt3(axis.0));
             d
         }
         FeatureKind::BoundaryFill { tools, cells, operation, remove_tools } => {
