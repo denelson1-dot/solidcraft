@@ -104,7 +104,25 @@ impl Drop for CadInput {
 pub struct ReportState {
     pub draft: Option<Draft>,
     pending: Option<Pending>,
+    /// A screenshot waiting for the preview being computed (#7171).
+    waiting: Option<Waiting>,
+    /// What was typed while a capture hid the report, for the form once it is back.
+    held: Vec<egui::Event>,
+    /// The report's field that had focus when a capture hid it.
+    refocus: Option<egui::Id>,
     cad_focus: Option<egui::Id>,
+}
+
+/// How long a screenshot waits for a preview being computed before it shows it unfinished.
+const PREVIEW_WAIT_MS: f64 = 10_000.0;
+/// Keystrokes kept while a capture hides the report.
+const MAX_HELD: usize = 4096;
+
+struct Waiting {
+    deadline: f64,
+    /// [`context_signature`] when it began: the preview it waits for belongs to the report
+    /// unless the design, the dialog or the selection changed meanwhile.
+    context: u64,
 }
 
 pub struct Draft {
@@ -119,6 +137,8 @@ pub struct Draft {
     texture: Option<TextureHandle>,
     pub note: String,
     source_signature: u64,
+    /// The description has taken the focus it gets on opening; Continue finding it empty clears
+    /// this, so it takes the focus once more (#7190).
     focus_requested: bool,
     missing_description: bool,
     opened_github: bool,
@@ -271,16 +291,29 @@ impl std::fmt::Write for Fingerprint {
     }
 }
 
-fn source_signature(app: &SolveApp, dialog: Option<&dialogs::Dialog>) -> u64 {
+/// What a report's context is drawn from: the design, the dialog and the selection.
+fn context_signature(app: &SolveApp, dialog: Option<&dialogs::Dialog>) -> u64 {
     let mut h = Fingerprint(std::collections::hash_map::DefaultHasher::new());
     app.session.revision.hash(&mut h.0);
     app.docs.active.hash(&mut h.0);
     app.docs.count().hash(&mut h.0);
     app.session.doc.name.hash(&mut h.0);
+    // What the dialog makes, not its state: a preview error it shows (a sketch fillet's) is often
+    // what is being reported.
+    if let Some(d) = dialog {
+        let _ = write!(&mut h, "{:?}{:?}{:?}", d.kind, d.inputs, d.extra);
+    }
+    let _ = write!(&mut h, "{:?}", app.session.selection);
+    h.0.finish()
+}
+
+/// [`context_signature`] and the preview shown with it.
+fn source_signature(app: &SolveApp, dialog: Option<&dialogs::Dialog>) -> u64 {
+    let mut h = Fingerprint(std::collections::hash_map::DefaultHasher::new());
+    context_signature(app, dialog).hash(&mut h.0);
     app.preview.key.hash(&mut h.0);
     app.preview.error.hash(&mut h.0);
     app.preview.busy.hash(&mut h.0);
-    let _ = write!(&mut h, "{:?}{:?}", dialog, app.session.selection);
     h.0.finish()
 }
 
@@ -302,6 +335,84 @@ fn reportable(feature: &solidcraft_engine::doc::Feature) -> bool {
 
 fn feature_context(feature: &solidcraft_engine::doc::Feature) -> String {
     format!("Feature {}: {}\n{}", feature.id, debug(&feature.name, 160), block(&json_context(&feature.kind, 2000)))
+}
+
+/// Messages and feature errors listed in a report (#7348), each entry cut to `MAX_ENTRY_CHARS`.
+const REPORT_MESSAGES: usize = 8;
+const REPORT_FAILURES: usize = 10;
+const MAX_ENTRY_CHARS: usize = 300;
+
+/// The user's home folder as text, for [`report_text`]; a bare root is never replaced.
+fn home_text() -> Option<String> {
+    let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })?;
+    let home = home.to_string_lossy().trim_end_matches(['/', '\\']).to_string();
+    (home.chars().count() > 1).then_some(home)
+}
+
+/// Untrusted text (messages, feature errors) as one quoted line: the home folder shown as `~`,
+/// cut to `MAX_ENTRY_CHARS` characters.
+fn report_text(text: &str, home: Option<&str>) -> String {
+    let mut text = limited(text, MAX_ENTRY_CHARS * 8);
+    if let Some(home) = home.filter(|h| h.chars().count() > 1) {
+        text = text.replace(home, "~");
+    }
+    if text.chars().count() > MAX_ENTRY_CHARS {
+        text = format!("{}…", text.chars().take(MAX_ENTRY_CHARS).collect::<String>());
+    }
+    format!("{text:?}")
+}
+
+/// How long ago `at` was, at `now` (both ms), in English like the rest of the report.
+fn report_ago(now: f64, at: f64) -> String {
+    let s = ((now - at) / 1000.0).max(0.0);
+    let s = if s.is_finite() { s.floor() } else { 0.0 };
+    if s < 60.0 {
+        format!("{s:.0} s ago")
+    } else if s < 3600.0 {
+        format!("{:.0} min ago", (s / 60.0).floor())
+    } else {
+        format!("{:.0} h ago", (s / 3600.0).floor())
+    }
+}
+
+/// The last messages of the Messages log, oldest first.
+fn messages_context(messages: &crate::messages::Messages, now: f64, home: Option<&str>) -> String {
+    let all = messages.iter();
+    let total = all.len();
+    if total == 0 {
+        return "\nMessages: none\n".into();
+    }
+    let shown = total.min(REPORT_MESSAGES);
+    let mut out = format!("\nMessages (last {shown} of {total}):\n");
+    for m in all.skip(total.saturating_sub(shown)) {
+        let level = if m.error { "error" } else { "info" };
+        let repeats = if m.count > 1 { format!(" (×{})", m.count) } else { String::new() };
+        out.push_str(&format!("    {} {level}: {}{repeats}\n", report_ago(now, m.at), report_text(&m.text, home)));
+    }
+    out
+}
+
+/// Every feature whose result has an error, in timeline order, not only the selected or latest one.
+fn failures_context(app: &SolveApp, home: Option<&str>) -> String {
+    let mut failing = app.session.doc.features.iter().filter_map(|f| app.session.model.result(f.id)?.error.as_deref().map(|e| (f, e)));
+    let mut out = String::new();
+    let mut count = 0usize;
+    for (feature, error) in failing.by_ref().take(REPORT_FAILURES) {
+        count += 1;
+        out.push_str(&format!(
+            "    Feature {} {} ({}): {}\n",
+            feature.id,
+            report_text(&feature.name, home),
+            feature.kind.type_name(),
+            report_text(error, home)
+        ));
+    }
+    let more = failing.count();
+    match (count, more) {
+        (0, _) => "\nFailing features: none\n".into(),
+        (n, 0) => format!("\nFailing features ({n}):\n{out}"),
+        (n, more) => format!("\nFailing features (first {n} of {}):\n{out}", n + more),
+    }
 }
 
 /// Read-only context excludes whole documents, sketch geometry and imported file contents.
@@ -341,6 +452,9 @@ pub fn draft_for(app: &SolveApp, dialog: Option<&dialogs::Dialog>, error: Option
             context.push_str(&format!("Feature error: {}\n", debug(&e, 1000)));
         }
     }
+    let home = home_text();
+    context.push_str(&failures_context(app, home.as_deref()));
+    context.push_str(&messages_context(&app.messages, crate::now_ms(), home.as_deref()));
     let actual = error.map(|e| debug(&e, 4000)).unwrap_or_else(|| "No command error was recorded.".into());
     let image_state = if error.is_some() {
         "A failed preview may display the last valid geometry; that geometry is not evidence that the failed operation succeeded."
@@ -494,14 +608,24 @@ pub fn begin(app: &mut SolveApp, ctx: &egui::Context, dialog: Option<&dialogs::D
 }
 
 fn cancel_capture(app: &mut SolveApp) {
+    app.issue_report.waiting = None;
     if let Some(pending) = app.issue_report.pending.take() {
         app.queued_shots.retain(|(token, ..)| *token != pending.token);
     }
 }
 
 fn capture(app: &mut SolveApp, ctx: &egui::Context, dialog: Option<&dialogs::Dialog>) {
+    capture_unless_busy(app, ctx, dialog, true);
+}
+
+/// Take a screenshot for the report; `wait`: while the preview is being computed, wait for it
+/// with the report open ([`tick`] takes it once it is done, #7171).
+fn capture_unless_busy(app: &mut SolveApp, ctx: &egui::Context, dialog: Option<&dialogs::Dialog>, wait: bool) {
     cancel_capture(app);
     let current_source = source_signature(app, dialog);
+    let context = context_signature(app, dialog);
+    let full = app.queued_shots.len() >= 16;
+    let busy = app.preview.busy;
     let Some(draft) = app.issue_report.draft.as_mut() else { return };
     draft.image = None;
     draft.texture = None;
@@ -511,16 +635,39 @@ fn capture(app: &mut SolveApp, ctx: &egui::Context, dialog: Option<&dialogs::Dia
                 .into();
         return;
     }
-    if app.preview.busy || app.queued_shots.len() >= 16 {
+    if wait && (busy || full) {
+        draft.note = "Waiting for the preview to finish to take the screenshot…".into();
+        app.issue_report.waiting = Some(Waiting { deadline: crate::now_ms() + PREVIEW_WAIT_MS, context });
+        ctx.request_repaint();
+        return;
+    }
+    if full {
         draft.note = "Screenshot unavailable while the preview is updating. Reopen the report after it settles, or continue with text.".into();
         return;
+    }
+    if busy {
+        draft.note = "The preview is still being computed: the screenshot shows it unfinished.".into();
+        let line = format!(
+            "\nThe preview was still being computed {:.0} s after the report opened; the screenshot shows it unfinished.\n",
+            PREVIEW_WAIT_MS / 1000.0
+        );
+        if !draft.body.contains(line.trim()) {
+            draft.body.push_str(&line);
+            truncate(&mut draft.body, MAX_BODY);
+        }
+    }
+    // The form hides for the capture: give its focused field back after it.
+    if draft.focus_requested {
+        app.issue_report.refocus = ctx.memory(|m| m.focused());
     }
     let Some(token) = app.shot_token.checked_add(1) else {
         draft.note = "Screenshot request limit reached; restart the app to capture another frame.".into();
         return;
     };
     app.shot_token = token;
-    draft.note = "Capturing the current app view locally…".into();
+    if !busy {
+        draft.note = "Capturing the current app view locally…".into();
+    }
     let now = crate::now_ms();
     app.issue_report.pending = Some(Pending {
         token,
@@ -538,7 +685,71 @@ pub(crate) fn pending(app: &SolveApp) -> bool {
     app.issue_report.pending.is_some()
 }
 
+/// While a capture hides the report, what is typed waits for the form to come back, which gets
+/// its focused field back: a screenshot taken once the preview is done can hide the form while
+/// its user types (#7171).
+pub(crate) fn hold_input(app: &mut SolveApp, raw: &mut egui::RawInput) {
+    let state = &mut app.issue_report;
+    if state.draft.is_none() {
+        state.held.clear();
+    } else if state.pending.is_some() {
+        let mut kept = Vec::with_capacity(raw.events.len());
+        for event in raw.events.drain(..) {
+            if typing(&event) {
+                if state.held.len() < MAX_HELD {
+                    state.held.push(event);
+                }
+            } else {
+                kept.push(event);
+            }
+        }
+        raw.events = kept;
+    } else if !state.held.is_empty() {
+        let mut events = std::mem::take(&mut state.held);
+        events.append(&mut raw.events);
+        raw.events = events;
+    }
+}
+
+/// What [`hold_input`] keeps for the form.
+fn typing(event: &egui::Event) -> bool {
+    matches!(
+        event,
+        egui::Event::Text(_) | egui::Event::Key { .. } | egui::Event::Paste(_) | egui::Event::Copy | egui::Event::Cut | egui::Event::Ime(_)
+    )
+}
+
 pub(crate) fn tick(app: &mut SolveApp, ctx: &egui::Context) {
+    if let Some(waiting) = &app.issue_report.waiting {
+        let settled = !app.preview.busy && app.queued_shots.len() < 16;
+        let (late, context) = (crate::now_ms() >= waiting.deadline, waiting.context);
+        if settled || late {
+            app.issue_report.waiting = None;
+            let dialog = app.dialog.clone();
+            // The preview the report waited for is what it shows now.
+            let source = source_signature(app, dialog.as_ref());
+            if context_signature(app, dialog.as_ref()) == context
+                && let Some(draft) = app.issue_report.draft.as_mut()
+            {
+                draft.source_signature = source;
+            }
+            capture_unless_busy(app, ctx, dialog.as_ref(), false);
+            // The capture hides the form before it is drawn this frame: what was typed in it
+            // waits with what comes while it is hidden.
+            if pending(app) {
+                let state = &mut app.issue_report;
+                ctx.input(|i| {
+                    for event in i.events.iter().filter(|e| typing(e)) {
+                        if state.held.len() < MAX_HELD {
+                            state.held.push(event.clone());
+                        }
+                    }
+                });
+            }
+        } else {
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        }
+    }
     let problem = app.issue_report.pending.as_ref().and_then(|p| {
         if signature(app, app.dialog.as_ref()) != p.signature || p.window != ctx.content_rect() || p.pixels_per_point != ctx.pixels_per_point() {
             Some("The model, inputs or view changed during capture. Retake the current view.")
@@ -625,6 +836,9 @@ fn fitted(image: Arc<ColorImage>, max: usize, max_side: usize) -> Option<Arc<Col
 pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
     if pending(app) {
         return;
+    }
+    if let Some(id) = app.issue_report.refocus.take() {
+        ctx.memory_mut(|m| m.request_focus(id));
     }
     let Some(mut draft) = app.issue_report.draft.take() else { return };
     let (retake, close) = form::show(app, &mut draft, ctx);
@@ -763,6 +977,32 @@ mod tests {
         }
     }
 
+    /// Continue with an empty description gives it the focus once (#7190). It used to take the
+    /// focus back every frame, so what was typed in Summary went into the description.
+    #[test]
+    fn issue_report_empty_description_takes_the_focus_once() {
+        let mut h = crate::scenario::Harness::new();
+        h.app.home.open = false;
+        h.app.issue_report.draft = Some(draft_for(&h.app, None, None));
+        h.frames(16);
+        let description = Some(egui::Id::new("issue_report_body"));
+        click_commands(&mut h, "Continue on GitHub");
+        assert_eq!(h.ctx.memory(|m| m.focused()), description);
+        // Click the Summary field (found by its id: it has no label of its own) and type.
+        let title = egui::Id::new("issue_report_title").accesskit_id();
+        let tree = h.output.accesskit_update.as_ref().unwrap();
+        let b = tree.nodes.iter().find(|(id, _)| *id == title).and_then(|(_, n)| n.bounds()).unwrap();
+        h.step(&json!({"click":[(b.x0 + b.x1) / 2.0, (b.y0 + b.y1) / 2.0]})).unwrap();
+        h.step(&json!({"text":"My title"})).unwrap();
+        h.frames(4);
+        let draft = h.app.issue_report.draft.as_ref().unwrap();
+        assert_eq!((draft.title.as_str(), draft.description.as_str()), ("My title", ""));
+        assert!(draft.missing_description && h.widget("Describe what happened before continuing.").is_some());
+        // Still empty: the next Continue gives it the focus again.
+        click_commands(&mut h, "Continue on GitHub");
+        assert_eq!(h.ctx.memory(|m| m.focused()), description);
+    }
+
     #[test]
     fn issue_report_handoff_includes_edits_from_the_click_frame() {
         for field in ["issue_report_body", "issue_report_title", "issue_report_steps", "issue_report_expected", "issue_report_technical"] {
@@ -875,6 +1115,73 @@ mod tests {
             assert!(draft.body.contains(expected), "missing {expected}: {}", draft.body);
         }
         assert_eq!(before, (app.session.doc.to_json(), app.session.revision, app.session.undo.len(), app.session.redo.len(), app.cam));
+    }
+
+    /// The sample with Fillet1 failing (the plate made narrower than its fillets).
+    fn failing_sample() -> SolveApp {
+        let mut s = Session::default();
+        s.run_script(&solidcraft_engine::sample::script()).unwrap();
+        s.execute("parameters.change", &json!({"name": "width", "expression": "5 mm"})).unwrap();
+        SolveApp::new(s, Default::default())
+    }
+
+    #[test]
+    fn issue_report_lists_the_last_messages_and_a_failing_feature_that_is_not_the_latest() {
+        let mut app = failing_sample();
+        let fillet = app.session.doc.features.iter().find(|f| f.name == "Fillet1").unwrap();
+        let error = app.session.model.result(fillet.id).and_then(|r| r.error.clone()).unwrap();
+        let latest = app.session.doc.features.iter().rev().find(|f| reportable(f)).unwrap();
+        assert_ne!(latest.id, fillet.id, "Fillet1 must not be the latest operation");
+        assert!(app.session.selection.is_empty());
+        let at = crate::now_ms() - 125_000.0;
+        for i in 0..12 {
+            app.messages.push(&format!("message number {i:02}"), i % 2 == 0, at);
+        }
+        app.messages.push("message number 11", false, at);
+        let draft = draft_for(&app, None, None);
+        let line = format!("Feature {} \"Fillet1\" (FilletFeature): {:?}", fillet.id, error);
+        assert!(draft.body.contains("Failing features (1):") && draft.body.contains(&line), "missing {line}: {}", draft.body);
+        assert!(draft.body.contains("Messages (last 8 of 12):"), "{}", draft.body);
+        for i in 0..4 {
+            assert!(!draft.body.contains(&format!("message number {i:02}")), "only the last 8 messages: {}", draft.body);
+        }
+        assert!(draft.body.contains("2 min ago error: \"message number 10\"\n"), "{}", draft.body);
+        assert!(draft.body.contains("2 min ago info: \"message number 11\" (×2)\n"), "{}", draft.body);
+        let latest = draft.body.find("Latest modeling operation").unwrap();
+        assert!(latest < draft.body.find("Failing features").unwrap() && latest < draft.body.find("Messages (").unwrap());
+        assert!(draft.body.find("Messages (").unwrap() < draft.body.find("## Environment").unwrap());
+    }
+
+    #[test]
+    fn issue_report_messages_and_feature_errors_hide_the_home_folder_and_stay_bounded() {
+        assert_eq!(report_text("Could not write /home/sample/Designs/part.step", Some("/home/sample")), "\"Could not write ~/Designs/part.step\"");
+        assert_eq!(report_text("/home/sample", Some("/")), "\"/home/sample\"", "a bare root is never replaced");
+        let mut app = app();
+        if let Some(home) = home_text() {
+            app.messages.push(&format!("Export failed: {home}/Designs/part.step is read-only"), true, crate::now_ms());
+            let draft = draft_for(&app, None, None);
+            assert!(draft.body.contains("error: \"Export failed: ~/Designs/part.step is read-only\""), "{}", draft.body);
+            assert!(!draft.body.contains(&home), "the home folder leaks: {}", draft.body);
+        }
+        for i in 0..12 {
+            app.run("solid.box", json!({"length":10,"width":10,"height":10,"body_name":format!("Box{i}")})).unwrap();
+        }
+        let hostile = "錯誤 ```\n## fake section 🚀".repeat(50_000);
+        for result in &mut app.session.model.results {
+            result.error = Some(hostile.clone());
+        }
+        app.messages.push(&hostile, true, f64::NAN);
+        let draft = draft_for(&app, None, None);
+        assert!(draft.body.len() <= MAX_BODY);
+        assert!(draft.body.contains("Failing features (first 10 of 12):"), "{}", draft.body);
+        assert!(!draft.body.contains("\n## fake section"), "untrusted text stays on one quoted line");
+        let section = draft.body.split("Failing features").nth(1).unwrap();
+        let section = section.split("\n## Environment").next().unwrap();
+        assert_eq!(section.lines().filter(|l| l.contains("錯誤")).count(), 11, "ten features and one message");
+        for line in section.lines() {
+            assert!(line.chars().count() < 2 * MAX_ENTRY_CHARS, "an entry is bounded: {} characters", line.chars().count());
+        }
+        assert!(section.contains("0 s ago error: \"錯誤"), "a broken time still reads: {section}");
     }
 
     #[test]
@@ -1027,6 +1334,32 @@ mod tests {
                     let [x, y] = h.widget(label).unwrap();
                     assert!(idle.contains(egui::pos2(x as f32, y as f32)), "{label} must stay visible: {idle:?}, {x}, {y}");
                 }
+            }
+        }
+    }
+
+    /// Save screenshot… writes the PNG where the picker says, the way the web app's other saves
+    /// write (#7192), and a failure reads as plain words, not a Rust value.
+    #[test]
+    fn issue_report_save_screenshot_writes_the_png_and_explains_a_failure() {
+        let mut h = crate::scenario::Harness::new();
+        h.app.home.open = false;
+        let mut draft = draft_for(&h.app, None, None);
+        draft.image = Some(Arc::new(ColorImage::new([4, 3], vec![egui::Color32::GREEN; 12])));
+        h.app.issue_report.draft = Some(draft);
+        h.frames(4);
+        for (path, saved) in [(h.dir.join("report.png"), true), (h.dir.join("missing").join("report.png"), false)] {
+            let answer = path.to_string_lossy().to_string();
+            h.app.services.pick_save = Some(Box::new(move |_, _| Box::pin(std::future::ready(Some(answer.clone())))));
+            click_commands(&mut h, "Save screenshot…");
+            let note = h.app.issue_report.draft.as_ref().unwrap().note.clone();
+            if saved {
+                let png = image::load_from_memory_with_format(&std::fs::read(&path).unwrap(), image::ImageFormat::Png).unwrap();
+                assert_eq!(png.into_rgba8().dimensions(), (4, 3));
+                assert_eq!(note, "Screenshot saved. Attach the PNG in the GitHub draft.");
+            } else {
+                let why = std::fs::write(&path, b"").unwrap_err();
+                assert_eq!(note, format!("Could not save screenshot: {why}"));
             }
         }
     }
@@ -1299,6 +1632,112 @@ mod tests {
         assert!(h.app.issue_report.draft.is_some());
         assert!(!h.app.file_load.busy(), "native drop must not queue an asynchronous open behind the draft");
         assert_eq!(h.app.docs.count(), tabs_before);
+    }
+
+    /// A report opened while the preview is being computed waits for it, open, and takes the
+    /// screenshot once it is done (#7171). It used to refuse and ask to reopen the report.
+    #[test]
+    fn issue_report_screenshot_waits_for_the_preview_then_is_taken() {
+        let mut app = app();
+        let ctx = crate::fonts::test_context();
+        app.preview.busy = true;
+        begin(&mut app, &ctx, None, None);
+        assert!(!pending(&app) && app.issue_report.waiting.is_some());
+        assert!(app.issue_report.draft.as_ref().unwrap().note.contains("Waiting for the preview"));
+        tick(&mut app, &ctx);
+        assert!(!pending(&app), "the preview is still being computed");
+        app.preview.busy = false;
+        app.preview.key += 1;
+        tick(&mut app, &ctx);
+        assert!(pending(&app), "taken once the preview is done");
+        let token = app.issue_report.pending.as_ref().unwrap().token;
+        receive(&mut app, token, Arc::new(ColorImage::new([4, 3], vec![egui::Color32::GREEN; 12])));
+        let draft = app.issue_report.draft.as_ref().unwrap();
+        assert!(draft.image.is_some(), "{}", draft.note);
+        assert!(!draft.body.contains("still being computed"));
+        // A selection changed while it waits: the report's context no longer matches the view.
+        app.preview.busy = true;
+        begin(&mut app, &ctx, None, None);
+        app.session.selection = vec![Sel::Feature { id: 1 }];
+        app.preview.busy = false;
+        tick(&mut app, &ctx);
+        let draft = app.issue_report.draft.as_ref().unwrap();
+        assert!(!pending(&app) && draft.image.is_none() && draft.note.contains("Settings or model changed"), "{}", draft.note);
+    }
+
+    /// A preview still being computed after a while is what the screenshot shows, and the report
+    /// says so: a hanging preview is often what is being reported.
+    #[test]
+    fn issue_report_screenshot_of_a_preview_that_takes_too_long_shows_it_unfinished() {
+        let mut app = app();
+        let ctx = crate::fonts::test_context();
+        app.preview.busy = true;
+        begin(&mut app, &ctx, None, None);
+        app.issue_report.waiting.as_mut().unwrap().deadline = -1.0;
+        tick(&mut app, &ctx);
+        assert!(pending(&app) && app.issue_report.waiting.is_none());
+        let draft = app.issue_report.draft.as_ref().unwrap();
+        assert!(draft.note.contains("unfinished") && draft.body.contains("still being computed 10 s after"), "{}", draft.note);
+        let token = app.issue_report.pending.as_ref().unwrap().token;
+        receive(&mut app, token, Arc::new(ColorImage::new([4, 3], vec![egui::Color32::GREEN; 12])));
+        assert!(app.issue_report.draft.as_ref().unwrap().image.is_some());
+    }
+
+    /// What is typed in the frame the preview finishes, as the waiting screenshot is taken and
+    /// hides the form, is kept too (#7171). A preview error the dialog shows meanwhile is not a
+    /// change: it is often what is being reported.
+    #[test]
+    fn issue_report_typing_as_a_waiting_screenshot_is_taken_is_kept() {
+        let mut h = crate::scenario::Harness::new();
+        h.app.home.open = false;
+        h.app.issue_report.draft = Some(draft_for(&h.app, None, None));
+        h.frames(8);
+        h.frame_with(vec![egui::Event::Text("The preview ".into())]);
+        // The wait ends in the next frame (here: its time is up), before the form is drawn.
+        let context = context_signature(&h.app, None);
+        h.app.issue_report.waiting = Some(Waiting { deadline: -1.0, context });
+        h.frame_with(vec![egui::Event::Text("vanished".into())]);
+        assert!(pending(&h.app) && h.app.issue_report.waiting.is_none());
+        h.frame_with(vec![egui::Event::Text(".".into())]);
+        let token = h.app.issue_report.pending.as_ref().unwrap().token;
+        receive(&mut h.app, token, Arc::new(ColorImage::new([4, 3], vec![egui::Color32::GREEN; 12])));
+        h.frames(4);
+        let draft = h.app.issue_report.draft.as_ref().unwrap();
+        assert_eq!(draft.description, "The preview vanished.");
+        assert!(draft.image.is_some(), "{}", draft.note);
+        // The dialog's preview error is not part of the context; its inputs are.
+        let mut app = app();
+        app.start("solid.combine");
+        let before = context_signature(&app, app.dialog.as_ref());
+        if let Some(d) = app.dialog.as_mut() {
+            d.error = Some("the operation failed".into());
+        }
+        assert_eq!(context_signature(&app, app.dialog.as_ref()), before);
+        if let Some(d) = app.dialog.as_mut() {
+            d.extra.insert("probe".into(), json!(1));
+        }
+        assert_ne!(context_signature(&app, app.dialog.as_ref()), before);
+    }
+
+    /// What is typed while a capture hides the report goes into the field it was typed in.
+    #[test]
+    fn issue_report_typing_while_a_capture_hides_the_report_is_kept() {
+        let mut h = crate::scenario::Harness::new();
+        h.app.home.open = false;
+        h.app.issue_report.draft = Some(draft_for(&h.app, None, None));
+        h.frames(8);
+        h.frame_with(vec![egui::Event::Text("The preview ".into())]);
+        let (ctx, dialog) = (h.ctx.clone(), h.app.dialog.clone());
+        capture(&mut h.app, &ctx, dialog.as_ref());
+        assert!(pending(&h.app));
+        h.frame_with(vec![egui::Event::Text("vanished".into())]);
+        h.frame_with(vec![egui::Event::Text(".".into())]);
+        let token = h.app.issue_report.pending.as_ref().unwrap().token;
+        receive(&mut h.app, token, Arc::new(ColorImage::new([4, 3], vec![egui::Color32::GREEN; 12])));
+        h.frames(4);
+        let draft = h.app.issue_report.draft.as_ref().unwrap();
+        assert_eq!(draft.description, "The preview vanished.");
+        assert!(draft.image.is_some());
     }
 
     #[test]

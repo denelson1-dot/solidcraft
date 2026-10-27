@@ -114,6 +114,8 @@ pub struct ViewportState {
     /// greys out with it.
     pub(crate) corner_ok: bool,
     pub gpu: Option<GpuTarget>,
+    /// The GPU plan evaluation still compiling: `gpu.tess` once it is ready (#4860).
+    pub(crate) tess_ready: Option<crate::gpu::TessReady>,
     /// What the GPU drew last frame, shared with the renderer (the frame-rate details, #2548).
     pub(crate) draw_stats: Option<crate::gpu::DrawStatsHandle>,
     /// The graphics backend and adapter, as the frame-rate details show them.
@@ -175,6 +177,8 @@ pub struct ViewportState {
     /// Inside a bracketed trackpad scroll (`Start` without its `End` yet):
     /// point moves pan, bare moves are a mouse.
     pub(crate) trackpad_gesture: bool,
+    /// The inertia after the fingers lift, which ends when the modifiers change (#7327).
+    pub(crate) trackpad_coast: crate::navigation::TrackpadCoast,
     /// A primary press on the axis gizmo: the pointer position used by its last orbit step.
     pub axis_drag: Option<Pos2>,
     /// Unsnapped camera while Shift-orbit previews a standard or diagonal view.
@@ -429,6 +433,9 @@ fn scene_key(app: &SolveApp) -> u64 {
     solidcraft_engine::doc::display_quality::current().hash(&mut h);
     lod_generation(app).hash(&mut h);
     app.viewport.mesh_lods.generation().hash(&mut h);
+    // How bodies are drawn: from their plans on the GPU, or built here (until the evaluation
+    // shader has compiled, #4860).
+    app.viewport.gpu.is_some_and(|g| g.tess).hash(&mut h);
     // The section plane (its cut outlines are part of the model scene).
     section_plane(app).map(|(o, n)| [o.x, o.y, o.z, n.x, n.y, n.z].map(f64::to_bits)).hash(&mut h);
     app.cam.up.hash(&mut h);
@@ -1538,17 +1545,7 @@ fn build_sketch_scene(app: &SolveApp, proj: &Proj) -> GpuScene {
         for (pts, col, cons) in sketch_lines_with_sampler(&ss.sketch, &ss.plane, active, &ss.report.curve_determined, |_, index, plane| {
             crate::sketch_display::curve_sample(app, sid, index, plane, proj).parts.clone()
         }) {
-            let segs = sketch_segments(
-                &pts,
-                if !cons {
-                    0
-                } else if col == colors::SKETCH_CENTERLINE {
-                    2
-                } else {
-                    1
-                },
-                unit,
-            );
+            let segs = sketch_segments(&pts, sketch_line_mode(col, cons), unit);
             let haloed = app.preferences.sketch_halo && !active && col != colors::SKETCH_PROJECTED && col != colors::SKETCH_LOST;
             strokes.push((segs, sc.color(sketch_color(&tk, col)), if cons { 1.2 } else { 2.0 }, haloed));
         }
@@ -1626,6 +1623,18 @@ fn ground_shadow(sc: &mut GpuScene, app: &SolveApp, st: &std::sync::Arc<solidcra
                 sc.shadow_tri(p01, c0);
             }
         }
+    }
+}
+
+/// The [`sketch_segments`] line type of a [`sketch_lines_with_sampler`] polyline: solid,
+/// construction (dashed) or centerline (dash-dot).
+fn sketch_line_mode(col: Rgb, cons: bool) -> u8 {
+    if !cons {
+        0
+    } else if col == colors::SKETCH_CENTERLINE {
+        2
+    } else {
+        1
     }
 }
 
@@ -2468,6 +2477,23 @@ fn feature_parts(app: &SolveApp, id: u64, shown_only: bool) -> Vec<Sel> {
     out
 }
 
+/// The sketches picked among `items` (a sketch row in the Browser or the timeline) that the
+/// highlight draws, shown or hidden (#7156). The sketch being edited shows its own selection.
+fn selected_sketches(app: &SolveApp, items: &[Sel]) -> Vec<u64> {
+    let st = crate::open_meshing::shown_world(app);
+    let mut out = Vec::new();
+    for item in items {
+        if let Sel::Feature { id } = item
+            && app.session.active_sketch != Some(*id)
+            && st.sketch(*id).is_some()
+            && !out.contains(id)
+        {
+            out.push(*id);
+        }
+    }
+    out
+}
+
 fn displayed_selection(app: &SolveApp, item: &Sel) -> Vec<Sel> {
     match item {
         Sel::Feature { id } => feature_geometry(app, *id),
@@ -3025,7 +3051,8 @@ fn highlight_key(app: &SolveApp) -> u64 {
     // Body triangles and outlines live in world space; the GPU applies the new camera.
     // Only sketch feedback needs projected tessellation and the profile's lift toward the eye.
     let projected = selected.iter().any(|s| matches!(s, Sel::Profile { .. } | Sel::SketchCurve { .. } | Sel::ExternalSketchCurve { .. }))
-        || matches!(app.viewport.hover, Some(Hit::Profile { .. }));
+        || matches!(app.viewport.hover, Some(Hit::Profile { .. }))
+        || !selected_sketches(app, &selected).is_empty();
     if projected {
         crate::sketch_display::projection_key(&display_proj(app), app.viewport.pixels_per_point()).hash(&mut h);
     }
@@ -3224,9 +3251,11 @@ pub(crate) fn build_highlight(app: &SolveApp) -> GpuScene {
     let active_bodies = s.active_occurrence_path.as_ref().and_then(|p| s.occurrence_bodies(p, true).ok());
     // Faces lit over the model use the triangles the model shows them with.
     let shown = |b: &solidcraft_engine::doc::ModelBody| shown_mesh(app, b, &active_bodies);
+    let items = app.highlighted();
+    let sketches = selected_sketches(app, &items);
     let mut sel = Vec::new();
-    for item in app.highlighted() {
-        for piece in displayed_selection(app, &item) {
+    for item in &items {
+        for piece in displayed_selection(app, item) {
             if !sel.iter().any(|x| crate::selection::same_item(x, &piece)) {
                 sel.push(piece);
             }
@@ -3318,7 +3347,8 @@ pub(crate) fn build_highlight(app: &SolveApp) -> GpuScene {
     }
     // Reference widgets follow zoom; the often much larger world-space feedback does not.
     let projected = sel.iter().any(|s| matches!(s, Sel::Profile { .. } | Sel::SketchCurve { .. } | Sel::ExternalSketchCurve { .. }))
-        || matches!(hover, Some(Hit::Profile { .. }));
+        || matches!(hover, Some(Hit::Profile { .. }))
+        || !sketches.is_empty();
     if !projected
         && let Some(cached) = app.viewport.hover_block.lock().ok().and_then(|cache| {
             cache.as_ref().filter(|c| c.key == key && std::sync::Arc::ptr_eq(&c.state, &st) && std::sync::Arc::ptr_eq(&c.doc, &s.doc)).cloned()
@@ -3417,6 +3447,19 @@ pub(crate) fn build_highlight(app: &SolveApp) -> GpuScene {
                 }
             }
             _ => {}
+        }
+    }
+    // A sketch picked in the Browser or the timeline: all its curves in their line types, over
+    // the model, also while the sketch is hidden or inside a body, so it is easy to find.
+    let (unit, proj) = (grid_step(app.cam.half_height()).0, display_proj(app));
+    let sel_edge = feedback.color(c4(t.sel_edge));
+    for ss in sketches.iter().filter_map(|id| st.sketch(*id)) {
+        for (pts, col, cons) in sketch_lines_with_sampler(&ss.sketch, &ss.plane, false, &[], |_, index, plane| {
+            crate::sketch_display::curve_sample(app, ss.feature, index, plane, &proj).parts.clone()
+        }) {
+            for (a, b) in sketch_segments(&pts, sketch_line_mode(col, cons), unit) {
+                feedback.line(a.to_f32(), b.to_f32(), sel_edge, 3.5, true);
+            }
         }
     }
     // Timeline modifiers light only their resulting faces; browser rows light whole bodies.
@@ -6673,6 +6716,51 @@ mod tests {
         }
     }
 
+    /// A sketch picked in the timeline or the Browser lights all its curves in the selection
+    /// colour, also while it is hidden (#7156); nothing is lit once it is no longer picked.
+    #[test]
+    fn a_picked_sketch_lights_its_curves_shown_or_hidden() {
+        let mut h = crate::scenario::Harness::new();
+        h.app.set_origin_shown(false);
+        h.app.run("solid.box", json!({"length":20,"width":20,"height":20})).unwrap();
+        h.app.run("sketch.create", json!({"plane":"XY","name":"Outline"})).unwrap();
+        h.app.run("sketch.rectangle.two_point", json!({"p0":[30,0],"p1":[40,10]})).unwrap();
+        h.app.run("sketch.circle.center", json!({"center":[35,5],"radius":3,"construction":true})).unwrap();
+        h.app.run("sketch.finish", json!({})).unwrap();
+        let id = h.app.session.doc.find_feature("Outline").unwrap().id;
+        h.frames(2);
+        let sel_edge = c4(Tokens::get().sel_edge);
+        // The selection-coloured strokes of the highlight, drawn over the model (a line holds its
+        // colour's palette index).
+        let lit = |app: &SolveApp| {
+            let scene = build_highlight(app).merged();
+            scene
+                .overlay
+                .as_chunks::<{ crate::gpu::LINE_SIZE }>()
+                .0
+                .iter()
+                .filter(|line| {
+                    let index = line.get(24..28).and_then(|b| b.try_into().ok()).map_or(0, u32::from_le_bytes);
+                    scene.palette.get(crate::gpu::PaletteIndex(index)) == Some(sel_edge)
+                })
+                .count()
+        };
+        assert_eq!(lit(&h.app), 0, "nothing is picked");
+        let p = crate::scenario::handle_at("timeline:Outline").unwrap();
+        h.step(&json!({"click":[p.x,p.y]})).unwrap();
+        assert_eq!(h.app.session.selection, vec![Sel::Feature { id }]);
+        let shown = lit(&h.app);
+        // Four sides, the circle's many segments and its dashes.
+        assert!(shown > 20, "the picked sketch's curves are lit: {shown}");
+        h.app.session.visibility.hidden_sketches.push(id);
+        assert!(!visible_sketches(&h.app).contains(&id));
+        assert_eq!(lit(&h.app), shown, "a hidden sketch is lit too");
+        h.app.session.selection = vec![Sel::Feature { id: h.app.session.doc.features[0].id }];
+        assert_eq!(lit(&h.app), 0, "another feature picked");
+        h.app.session.selection.clear();
+        assert_eq!(lit(&h.app), 0, "nothing is picked");
+    }
+
     #[test]
     fn history_marker_shows_only_its_sketch_without_changing_visibility() -> Result<(), Box<dyn std::error::Error>> {
         for explicitly_hidden in [false, true] {
@@ -8894,6 +8982,68 @@ mod tests {
         let after = h.app.cam;
         h.frames(90);
         assert_eq!(h.app.cam, after);
+    }
+
+    /// #7327: macOS sends the inertia after the fingers lift as its own scroll bracket, right after
+    /// the fingers' one, with the modifiers held at the time. Releasing Shift while an orbit coasts
+    /// (or pressing it while a pan coasts) ends the coast instead of carrying it into the other mode.
+    #[test]
+    fn fusion_trackpad_inertia_stops_when_shift_changes() {
+        use egui::{Modifiers, TouchPhase::*};
+        let mut h = crate::scenario::Harness::new();
+        h.app.preferences.nav = "fusion".into();
+        h.app.preferences.orbit_around = crate::prefs::OrbitAround::ViewCentre;
+        h.call("ui.move", json!({"x":800,"y":500}));
+        let gesture = |phase, modifiers| egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta: vec2(20.0, -10.0), modifiers, phase };
+        let play = |h: &mut crate::scenario::Harness, phase, modifiers| {
+            h.app.synthetic.push(gesture(phase, modifiers));
+            h.frame();
+        };
+        for (held, other) in [(Modifiers::SHIFT, Modifiers::NONE), (Modifiers::NONE, Modifiers::SHIFT)] {
+            // The fingers swipe and lift; the coast starts in the next frame and keeps their mode.
+            for phase in [Start, Move, Move, End, Start, Move] {
+                play(&mut h, phase, held);
+            }
+            let coasting = h.app.cam;
+            play(&mut h, Move, held);
+            assert_ne!(h.app.cam, coasting, "{held:?}: the coast keeps moving while the modifiers stay");
+            // The modifiers change: the rest of the coast is dropped, even when they change back.
+            let stopped = h.app.cam;
+            for modifiers in [other, other, held, other] {
+                play(&mut h, Move, modifiers);
+                assert_eq!(h.app.cam, stopped, "{held:?}: the coast must end, not pan or orbit");
+            }
+            play(&mut h, End, other);
+            h.frames(30);
+            assert_eq!(h.app.cam, stopped);
+        }
+        // Fingers touching during a coast are a new swipe: it moves at once and still switches
+        // between pan and orbit with Shift while the fingers stay down.
+        for phase in [Start, Move, Move, End, Start, Move] {
+            play(&mut h, phase, Modifiers::SHIFT);
+        }
+        play(&mut h, End, Modifiers::SHIFT);
+        play(&mut h, Start, Modifiers::SHIFT);
+        for modifiers in [Modifiers::SHIFT, Modifiers::NONE, Modifiers::SHIFT] {
+            let before = h.app.cam;
+            play(&mut h, Move, modifiers);
+            if modifiers.shift {
+                let mut expected = before;
+                expected.orbit(20.0, -10.0);
+                assert_eq!(h.app.cam, expected, "a new swipe orbits with Shift");
+            } else {
+                assert_eq!(h.app.cam.back(), before.back());
+                assert_ne!(h.app.cam.target, before.target, "a new swipe pans without Shift");
+            }
+        }
+        play(&mut h, End, Modifiers::NONE);
+        // A swipe after a pause is a new swipe too, whatever the last one did.
+        h.frames(30);
+        play(&mut h, Start, Modifiers::NONE);
+        let before = h.app.cam;
+        play(&mut h, Move, Modifiers::NONE);
+        assert_ne!(h.app.cam.target, before.target, "a later swipe pans");
+        play(&mut h, End, Modifiers::NONE);
     }
 
     #[test]
