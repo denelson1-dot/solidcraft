@@ -602,6 +602,9 @@ pub enum TriClass {
 #[derive(Default, Clone)]
 pub struct BlockBytes {
     pub vertices: Arc<Vec<u8>>,
+    /// Each body's share of `vertices` and the box around it: a body out of the view is left
+    /// out of the draws ([`Batches::cull`]). Vertices outside every span are always drawn.
+    pub bodies: Arc<Vec<BodySpan>>,
     pub opaque: Arc<Vec<std::ops::Range<u32>>>,
     pub glass: Arc<Vec<std::ops::Range<u32>>>,
     pub faded: Arc<Vec<std::ops::Range<u32>>>,
@@ -618,6 +621,43 @@ impl BlockBytes {
             TriClass::Faded => &self.faded,
         }
     }
+}
+
+/// A body's vertices in a block and the box around them.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BodySpan {
+    pub vertices: std::ops::Range<u32>,
+    pub bounds: [[f32; 3]; 2],
+}
+
+/// `runs` without the vertices in `hidden` (both sorted and disjoint).
+fn runs_without(runs: &[std::ops::Range<u32>], hidden: &[std::ops::Range<u32>]) -> Vec<std::ops::Range<u32>> {
+    let mut out = Vec::with_capacity(runs.len());
+    let mut h = hidden.iter().peekable();
+    for r in runs {
+        let mut start = r.start;
+        while let Some(x) = h.peek() {
+            if x.end <= start {
+                h.next();
+                continue;
+            }
+            if x.start >= r.end {
+                break;
+            }
+            if x.start > start {
+                out.push(start..x.start);
+            }
+            start = start.max(x.end);
+            if x.end >= r.end {
+                break;
+            }
+            h.next();
+        }
+        if start < r.end {
+            out.push(start..r.end);
+        }
+    }
+    out
 }
 
 /// Add a triangle starting at vertex `at` to `runs`, extending the last run when it ends there.
@@ -638,9 +678,28 @@ pub struct BlockBuilder {
     faded: Vec<std::ops::Range<u32>>,
     lines: Vec<u8>,
     hidden: Vec<u8>,
+    bodies: Vec<BodySpan>,
+    /// The body being written: its first vertex and the box so far.
+    open: Option<(u32, [[f32; 3]; 2])>,
 }
 
 impl BlockBuilder {
+    /// The triangles from here to [`BlockBuilder::end_body`] are one body's (its box is kept, so
+    /// it can be left out of a view it is not in).
+    pub fn begin_body(&mut self) {
+        let at = u32::try_from(self.vertices.len() / TRI_SIZE).unwrap_or(u32::MAX);
+        self.open = Some((at, [[f32::INFINITY; 3], [f32::NEG_INFINITY; 3]]));
+    }
+
+    /// End the body [`BlockBuilder::begin_body`] began.
+    pub fn end_body(&mut self) {
+        let Some((start, bounds)) = self.open.take() else { return };
+        let end = u32::try_from(self.vertices.len() / TRI_SIZE).unwrap_or(u32::MAX);
+        if end > start && bounds.iter().flatten().all(|x| x.is_finite()) {
+            self.bodies.push(BodySpan { vertices: start..end, bounds });
+        }
+    }
+
     /// Room for `triangles` more triangles, so a block of large bodies is written without
     /// reallocating (and copying) its vertex stream as it grows.
     pub fn reserve_triangles(&mut self, triangles: usize) {
@@ -658,6 +717,14 @@ impl BlockBuilder {
             }
         }
         self.vertices.extend_from_slice(&record);
+        if let Some((_, [lo, hi])) = &mut self.open {
+            for v in p {
+                for k in 0..3 {
+                    lo[k] = lo[k].min(v[k]);
+                    hi[k] = hi[k].max(v[k]);
+                }
+            }
+        }
         let runs = match class {
             TriClass::Opaque => &mut self.opaque,
             TriClass::Glass => &mut self.glass,
@@ -678,21 +745,11 @@ impl BlockBuilder {
 
     /// A depth-tested line, or one only shown where the model hides it.
     pub fn line(&mut self, a: [f32; 3], b: [f32; 3], c: PaletteIndex, width: f32) {
-        let out = &mut self.lines;
-        for v in a.iter().chain(&b) {
-            out.extend_from_slice(&v.to_le_bytes());
-        }
-        out.extend_from_slice(&c.0.to_le_bytes());
-        out.extend_from_slice(&width.to_le_bytes());
+        self.lines.extend_from_slice(&line_record(a, b, c, width.to_bits()));
     }
 
     pub fn hidden_line(&mut self, a: [f32; 3], b: [f32; 3], c: PaletteIndex, width: f32) {
-        let out = &mut self.hidden;
-        for v in a.iter().chain(&b) {
-            out.extend_from_slice(&v.to_le_bytes());
-        }
-        out.extend_from_slice(&c.0.to_le_bytes());
-        out.extend_from_slice(&width.to_le_bytes());
+        self.hidden.extend_from_slice(&line_record(a, b, c, width.to_bits()));
     }
 
     /// How many vertices the block holds so far.
@@ -704,6 +761,7 @@ impl BlockBuilder {
     pub fn freeze(self) -> Arc<BlockBytes> {
         Arc::new(BlockBytes {
             vertices: Arc::new(self.vertices),
+            bodies: Arc::new(self.bodies),
             opaque: Arc::new(self.opaque),
             glass: Arc::new(self.glass),
             faded: Arc::new(self.faded),
@@ -742,11 +800,14 @@ impl GpuScene {
     }
     /// A line shown only where the model hides it.
     pub fn hidden_line(&mut self, a: [f32; 3], b: [f32; 3], c: PaletteIndex, width: f32) {
-        for v in a.iter().chain(&b) {
-            self.hidden.extend_from_slice(&v.to_le_bytes());
-        }
-        self.hidden.extend_from_slice(&c.0.to_le_bytes());
-        self.hidden.extend_from_slice(&width.to_le_bytes());
+        self.hidden.extend_from_slice(&line_record(a, b, c, width.to_bits()));
+    }
+
+    /// Room for `lines` more lines and `hidden` more hidden lines, so a highlight of many edges
+    /// is written without growing its buffers line by line.
+    pub fn reserve_lines(&mut self, lines: usize, hidden: usize) {
+        let _ = self.lines.try_reserve(lines.saturating_mul(LINE_SIZE));
+        let _ = self.hidden.try_reserve(hidden.saturating_mul(LINE_SIZE));
     }
     pub fn glass_tri(&mut self, p: [f32; 3], n: [f32; 3], c: PaletteIndex) {
         for v in p.iter().chain(&n) {
@@ -795,20 +856,28 @@ impl GpuScene {
     /// unknown), so a face seen at a grazing angle no longer buries part of the band (it showed as
     /// a thin wedge instead of a line). See [`lifted_width`] for how this travels.
     pub fn lifted_line(&mut self, a: [f32; 3], b: [f32; 3], c: PaletteIndex, width: f32, normals: [[f32; 3]; 2]) {
-        for v in a.iter().chain(&b) {
-            self.lines.extend_from_slice(&v.to_le_bytes());
-        }
-        self.lines.extend_from_slice(&c.0.to_le_bytes());
-        self.lines.extend_from_slice(&lifted_width(width, normals).to_le_bytes());
+        self.lifted_line_word(a, b, c, lifted_width(width, normals));
+    }
+    /// [`GpuScene::lifted_line`] with its width word already worked out ([`lifted_width`]), for
+    /// many segments that share it.
+    pub fn lifted_line_word(&mut self, a: [f32; 3], b: [f32; 3], c: PaletteIndex, word: u32) {
+        self.lines.extend_from_slice(&line_record(a, b, c, word));
     }
     pub fn line(&mut self, a: [f32; 3], b: [f32; 3], c: PaletteIndex, width: f32, on_top: bool) {
         let out = if on_top { &mut self.overlay } else { &mut self.lines };
-        for v in a.iter().chain(&b) {
-            out.extend_from_slice(&v.to_le_bytes());
-        }
-        out.extend_from_slice(&c.0.to_le_bytes());
-        out.extend_from_slice(&width.to_le_bytes());
+        out.extend_from_slice(&line_record(a, b, c, width.to_bits()));
     }
+}
+
+/// One line's [`LINE_SIZE`] bytes: its ends, its palette index and its width word (an `f32`'s
+/// bits, or [`lifted_width`]'s).
+fn line_record(a: [f32; 3], b: [f32; 3], c: PaletteIndex, width: u32) -> [u8; LINE_SIZE] {
+    let mut out = [0u8; LINE_SIZE];
+    let words = a.into_iter().chain(b).map(f32::to_bits).chain([c.0, width]);
+    for (chunk, word) in out.as_chunks_mut::<4>().0.iter_mut().zip(words) {
+        *chunk = word.to_le_bytes();
+    }
+    out
 }
 
 pub type SceneSlot = Arc<Mutex<Option<GpuScene>>>;
@@ -1210,6 +1279,9 @@ struct BlockGpu {
     faded: Option<ClassGpu>,
     lines: Option<Batch>,
     hidden: Option<Batch>,
+    /// The runs of each class (opaque, glass, faded) without the bodies out of the view, while
+    /// some are ([`Batches::cull`]); `None`: every body is drawn.
+    culled: Option<[Vec<std::ops::Range<u32>>; 3]>,
 }
 
 fn class_gpu(
@@ -1281,7 +1353,7 @@ impl BlockGpu {
         };
         let lines = keep(old.as_ref(), |b| &b.lines, |b| b.lines.as_ref()).or_else(|| fresh(&bytes.lines, "sc_block_lines"));
         let hidden = keep(old.as_ref(), |b| &b.hidden, |b| b.hidden.as_ref()).or_else(|| fresh(&bytes.hidden, "sc_block_hidden"));
-        BlockGpu { bytes, vertices, opaque, glass, faded, lines, hidden }
+        BlockGpu { bytes, vertices, opaque, glass, faded, lines, hidden, culled: None }
     }
 
     fn class(&self, class: TriClass) -> Option<&ClassGpu> {
@@ -1298,6 +1370,7 @@ impl BlockGpu {
             Some(ClassGpu::Runs(runs)) => {
                 let Some(vertices) = &self.vertices else { return };
                 pass.set_vertex_buffer(0, vertices.slice(..));
+                let runs = self.culled.as_ref().map_or(&runs[..], |c| &c[class as usize][..]);
                 for r in runs.iter() {
                     pass.draw(r.clone(), 0..1);
                     tally.triangles(r.len() as u32, 1);
@@ -1470,14 +1543,21 @@ impl PaletteGpu {
 const CHUNK_SPLIT: u64 = 32;
 const MAX_CHUNK_BODIES: usize = 128;
 
+/// A block's see-through triangles as the global glass stream took them ([`Batches::glass_from`]).
+struct GlassSource {
+    key: u64,
+    vertices: Arc<Vec<u8>>,
+    glass: Arc<Vec<std::ops::Range<u32>>>,
+}
+
 #[derive(Default)]
 struct Batches {
     /// What the last scene taken uploaded.
     uploads: UploadStats,
     /// The blocks' see-through triangles the global glass stream was assembled from (block key,
-    /// vertices and glass runs, by address), when it holds nothing else: an edit that changes
-    /// neither leaves the sorted stream as it is.
-    glass_from: Option<Vec<(u64, usize, usize)>>,
+    /// vertices and glass runs, held so their addresses cannot be reused), when it holds nothing
+    /// else: an edit that changes neither leaves the sorted stream as it is.
+    glass_from: Option<Vec<GlassSource>>,
     /// The scene's palette texture and its group 0 bind (uniform + palette).
     palette: Option<PaletteGpu>,
     /// The scene blocks on the GPU, by key, and their drawing order.
@@ -1492,6 +1572,8 @@ struct Batches {
     /// The glass triangles as built, and the view direction they were last sorted for.
     glass_cpu: Vec<u8>,
     glass_sorted_for: Option<[f32; 3]>,
+    /// The view the blocks' bodies were last culled for ([`Batches::cull`]).
+    blocks_culled_for: Option<[[f32; 4]; 4]>,
     lines: Option<Batch>,
     hidden: Option<Batch>,
     overlays: Option<Batch>,
@@ -1594,16 +1676,23 @@ impl Batches {
             // so cross-body blend order is kept; the blocks' glass triangles join it here. With
             // OIT the blocks draw their own runs and nothing is sorted. A stream made of the same
             // blocks' glass as before (a colour or opacity edit, a selection) is kept as sorted.
-            let from: Vec<(u64, usize, usize)> = if oit_available {
+            let from: Vec<GlassSource> = if oit_available {
                 Vec::new()
             } else {
                 sc.blocks
                     .iter()
                     .filter(|b| !b.bytes.glass.is_empty())
-                    .map(|b| (b.key, Arc::as_ptr(&b.bytes.vertices) as usize, Arc::as_ptr(&b.bytes.glass) as usize))
+                    .map(|b| GlassSource { key: b.key, vertices: b.bytes.vertices.clone(), glass: b.bytes.glass.clone() })
                     .collect()
             };
-            let same_glass = sc.glass.is_empty() && self.glass_from.as_ref() == Some(&from);
+            let same_glass = sc.glass.is_empty()
+                && self.glass_from.as_ref().is_some_and(|was| {
+                    was.len() == from.len()
+                        && was
+                            .iter()
+                            .zip(&from)
+                            .all(|(a, b)| a.key == b.key && Arc::ptr_eq(&a.vertices, &b.vertices) && Arc::ptr_eq(&a.glass, &b.glass))
+                });
             if !same_glass {
                 self.glass_cpu.clear();
                 self.glass_cpu.extend_from_slice(&sc.glass);
@@ -1618,6 +1707,7 @@ impl Batches {
                 self.glass_from = sc.glass.is_empty().then_some(from);
             }
             self.uploads.geometry += geometry;
+            self.blocks_culled_for = None;
             self.key = Some(key);
         }
     }
@@ -1664,6 +1754,23 @@ impl Batches {
         out
     }
 
+    /// Leave the blocks' bodies that are out of the view `vp` out of their draws: each class's
+    /// runs without those bodies' vertices. Worked out again only when the view changes; a block
+    /// with every body in view draws its runs as they are.
+    fn cull_blocks(&mut self, vp: &[[f32; 4]; 4]) {
+        if self.blocks_culled_for.as_ref() == Some(vp) {
+            return;
+        }
+        self.blocks_culled_for = Some(*vp);
+        const ROWS: [[f32; 4]; 3] = [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0]];
+        for block in self.blocks.values_mut() {
+            let hidden: Vec<std::ops::Range<u32>> =
+                block.bytes.bodies.iter().filter(|b| !placed_box_in_view(&ROWS, &b.bounds, vp)).map(|b| b.vertices.clone()).collect();
+            block.culled = (!hidden.is_empty())
+                .then(|| [TriClass::Opaque, TriClass::Glass, TriClass::Faded].map(|class| runs_without(block.bytes.runs(class), &hidden)));
+        }
+    }
+
     /// Keep only the placements of the instanced meshes that may be seen in the view `vp` (see
     /// [`placed_box_in_view`]): a part placed many times, most of it out of the view, draws
     /// only what is in it. The placements are written again only when that set changes.
@@ -1671,6 +1778,7 @@ impl Batches {
     /// [`LOD_PX`] where it is drawn ([`placement_scale`], [`level_for`]), in a view of `size`
     /// pixels.
     fn cull(&mut self, queue: &wgpu::Queue, vp: &[[f32; 4]; 4], size: [f32; 2]) {
+        self.cull_blocks(vp);
         let f = |b: &[u8], i: usize| b.get(i..i + 4).and_then(|x| x.try_into().ok()).map_or(0.0, f32::from_le_bytes);
         for d in &mut self.instanced {
             let errors: Vec<f32> = d.levels.iter().map(|l| l.error).collect();
@@ -3900,6 +4008,48 @@ mod glass_tests {
         let scene = 524_434_680usize;
         assert_eq!(scene.div_ceil(buffer_chunk(TRI_SIZE, limit)), 2);
         assert!(buffer_chunk(TRI_SIZE, 1) >= TRI_SIZE * 6, "a tiny limit still holds one unit");
+    }
+
+    /// Bodies out of the view are cut out of a class's runs, wherever they fall in them: inside
+    /// a run, over its ends, across two runs, or not at all.
+    #[test]
+    fn runs_without_hidden_bodies() {
+        let r = |v: &[(u32, u32)]| v.iter().map(|&(a, b)| a..b).collect::<Vec<_>>();
+        let cut = |runs: &[(u32, u32)], hidden: &[(u32, u32)]| runs_without(&r(runs), &r(hidden));
+        assert_eq!(cut(&[(0, 30)], &[(9, 18)]), r(&[(0, 9), (18, 30)]));
+        assert_eq!(cut(&[(0, 9), (12, 30)], &[(6, 15)]), r(&[(0, 6), (15, 30)]));
+        assert_eq!(cut(&[(0, 9), (12, 30)], &[(0, 9), (27, 30)]), r(&[(12, 27)]));
+        assert_eq!(cut(&[(3, 6)], &[(0, 3), (6, 9)]), r(&[(3, 6)]));
+        assert_eq!(cut(&[(0, 30)], &[(0, 30)]), r(&[]));
+        assert_eq!(cut(&[(0, 12), (15, 24)], &[]), r(&[(0, 12), (15, 24)]));
+    }
+
+    /// A line is written as one record: its ends, its palette index and its width word, each
+    /// four little-endian bytes, as the shader reads them; a lifted line's word is
+    /// [`lifted_width`]'s, whether worked out per segment or once for many.
+    #[test]
+    fn lines_are_written_as_one_record() {
+        let (a, b, c): ([f32; 3], [f32; 3], _) = ([1.0, -2.0, 3.5], [4.0, 5.0, -6.25], PaletteIndex(7));
+        let mut expected = Vec::new();
+        for v in a.iter().chain(&b) {
+            expected.extend_from_slice(&v.to_le_bytes());
+        }
+        expected.extend_from_slice(&7u32.to_le_bytes());
+        expected.extend_from_slice(&1.5f32.to_le_bytes());
+        let mut sc = GpuScene::default();
+        sc.line(a, b, c, 1.5, false);
+        sc.hidden_line(a, b, c, 1.5);
+        assert_eq!(sc.lines, expected);
+        assert_eq!(sc.hidden, expected);
+        let normals = [[0.0, 0.0, 1.0], [1.0, 0.0, 0.0]];
+        let (mut per_segment, mut shared) = (GpuScene::default(), GpuScene::default());
+        per_segment.lifted_line(a, b, c, 2.0, normals);
+        shared.lifted_line_word(a, b, c, lifted_width(2.0, normals));
+        assert_eq!(per_segment.lines, shared.lines);
+        assert_eq!(per_segment.lines.get(28..32), Some(&lifted_width(2.0, normals).to_le_bytes()[..]));
+        let mut block = BlockBuilder::default();
+        block.line(a, b, c, 1.5);
+        assert_eq!(*block.freeze().lines, expected);
     }
 
     /// Without order-independent transparency, the sorted glass stream is kept while the blocks'
