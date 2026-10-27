@@ -957,6 +957,12 @@ pub(crate) fn resize_column(app: &mut SolveApp, ui: &egui::Ui, rect: Rect, width
     crate::scenario::publish_handle(handle, pos2(rect.right() - BROWSER_RAIL / 2.0, rect.center().y));
 }
 
+/// The width of the browser folded to its rail beside a left History.
+pub(crate) fn collapsed_width() -> f32 {
+    let t = Tokens::get();
+    t.space_24 + t.space_10
+}
+
 /// One content-hugging browser; the shared container supplies floating or flush compact chrome.
 pub fn browser(app: &mut SolveApp, ui: &mut egui::Ui) {
     let available = ui.available_rect_before_wrap();
@@ -966,6 +972,11 @@ pub fn browser(app: &mut SolveApp, ui: &mut egui::Ui) {
     DRAWN.with(|d| d.borrow_mut().clear());
     OCCURRENCES.with(|d| d.borrow_mut().clear());
     let mut acts = Actions { hover_bodies: std::mem::take(&mut app.viewport.hover_bodies), ..Default::default() };
+    if crate::render_workspace::active(app) {
+        render_card(app, ui, &mut acts);
+        finish_browser(app, ui, acts);
+        return;
+    }
     let stacked = crate::timeline_left::stacked(app);
     let container =
         Container::new(ui.ctx(), Surface::Panel).joined(crate::ui_kit::DockEdges { left: true, top: true, bottom: stacked, ..Default::default() });
@@ -986,11 +997,12 @@ pub fn browser(app: &mut SolveApp, ui: &mut egui::Ui) {
     let bounds = if stacked {
         crate::timeline_left::stacked_rects(app, available).0
     } else {
-        panel_bounds(available, if vertical { None } else { app.shell.history }, if collapsed { t.space_24 + t.space_10 } else { width }, gap)
+        panel_bounds(available, if vertical { None } else { app.shell.history }, if collapsed { collapsed_width() } else { width }, gap)
     };
     app.shell.browser = None;
     let min_height = HEADER_H + 2.0 * (CARD_INSET + 1.0);
-    if bounds.is_positive() && bounds.height() >= min_height {
+    // A dialog in the left column holds the browser's place (`dialog_column`).
+    if !crate::dialog_column::holds(app) && bounds.is_positive() && bounds.height() >= min_height {
         let fill = if container.floating() && app.preferences.browser_float { t.panel.gamma_multiply(BROWSER_FLOAT_ALPHA) } else { t.panel };
         let frame = container.frame(ui.ctx(), fill, crate::frame::Side::Left).inner_margin(CARD_INSET as i8);
         let inner_width = (bounds.width() - frame.total_margin().sum().x).max(0.0);
@@ -1027,6 +1039,38 @@ pub fn browser(app: &mut SolveApp, ui: &mut egui::Ui) {
         }
     }
     finish_browser(app, ui, acts);
+}
+
+fn render_card(app: &mut SolveApp, ui: &mut egui::Ui, acts: &mut Actions) {
+    let bounds = crate::shell::panel_bounds(app, ui.available_rect_before_wrap());
+    let mut side = app.preferences.render_browser_side.clone();
+    let mut width = app.preferences.render_browser_width;
+    let title = app.tr("ui.browser_title").to_string();
+    let content = crate::ui_kit::Panel::workspace(
+        ui,
+        crate::ui_kit::WorkspaceOptions { id: "render:browser", title: &title, icon: "list", bounds, fill_height: true },
+        &mut side,
+        &mut width,
+        |ui| {
+            browser_contents(app, ui, acts, true);
+        },
+    );
+    app.preferences.render_browser_width = width;
+    if app.preferences.render_browser_side != side {
+        app.preferences.render_inspector_side = if side == "left" { "right" } else { "left" }.into();
+    }
+    app.preferences.render_browser_side = side.clone();
+    let rect = content.map(|c| c.response.rect);
+    app.shell.browser = rect;
+    crate::shell::register_panel(
+        app,
+        "render:browser",
+        rect,
+        Some(if side == "left" { crate::ui_kit::Edge::Left } else { crate::ui_kit::Edge::Right }),
+    );
+    if let Some(rect) = rect {
+        crate::scenario::publish_rect("browser:card", rect);
+    }
 }
 
 fn browser_collapsed_rail(app: &mut SolveApp, ui: &mut egui::Ui) {
@@ -1066,9 +1110,13 @@ pub(crate) fn panel_bounds(available: Rect, history: Option<Rect>, width: f32, g
 fn browser_contents(app: &mut SolveApp, ui: &mut egui::Ui, acts: &mut Actions, collapsible: bool) {
     let t = Tokens::get();
     // Only the floating card folds; the docked column keeps its full height.
-    browser_header(app, ui, collapsible);
-    let stacked = crate::timeline_left::stacked(app);
-    if collapsible
+    let render = crate::render_workspace::active(app);
+    if !render {
+        browser_header(app, ui, collapsible);
+    }
+    let stacked = !render && crate::timeline_left::stacked(app);
+    if !render
+        && collapsible
         && (if stacked {
             (app.preferences.timeline_left_browser_collapsed && app.shell.history_folding.is_none_or(|p| p[0] >= 1.0))
                 || ui.available_height() <= t.space_3
