@@ -1039,6 +1039,18 @@ impl SolveApp {
                     &strings("closed_by_default"),
                 );
             }
+            if id == "view.render_focus"
+                && let Some(on) = v.get("on").and_then(Value::as_bool)
+            {
+                self.shell.render_focus = on;
+                render_ui::reset_shell(self);
+                self.shell.content = None;
+            }
+            if id == "view.render_browser"
+                && let Some(open) = v.get("open").and_then(Value::as_bool)
+            {
+                self.shell.render_browser_open = open;
+            }
             if id == "view.render_stage"
                 && let Some(stage) = v.get("stage").and_then(Value::as_str)
             {
@@ -1049,6 +1061,18 @@ impl SolveApp {
                 self.ui.pick_bodies = mode == Some("body");
                 self.ui.pick_components = mode == Some("component");
                 self.ui.pick_off.retain(|kind| kind != "faces");
+            }
+            if id == "view.render_dock"
+                && let (Some(panel), Some(side)) = (v.get("panel").and_then(Value::as_str), v.get("side").and_then(Value::as_str))
+            {
+                let other = if side == "left" { "right" } else { "left" };
+                if panel == "inspector" {
+                    self.preferences.render_inspector_side = side.into();
+                    self.preferences.render_browser_side = other.into();
+                } else {
+                    self.preferences.render_browser_side = side.into();
+                    self.preferences.render_inspector_side = other.into();
+                }
             }
             if id == "view.shots_strip"
                 && let Some(visible) = v.get("visible").and_then(Value::as_bool)
@@ -1265,6 +1289,14 @@ impl SolveApp {
         if id == "view.layout" {
             let mode = if self.ui.layout == shell::LayoutMode::Floating { "compact" } else { "floating" };
             let _ = self.run(id, json!({"mode":mode}));
+            return;
+        }
+        if id == "view.render_focus" {
+            let _ = self.run(id, json!({"on": !self.shell.render_focus}));
+            return;
+        }
+        if id == "view.render_browser" {
+            let _ = self.run(id, json!({"open": !self.shell.render_browser_open}));
             return;
         }
         if id == "view.shots_strip" {
@@ -2214,6 +2246,7 @@ impl SolveApp {
         }
         let floating = render_workspace::active(self) || ui_kit::Container::new(ui.ctx(), ui_kit::Surface::Panel).floating();
         timeline::follow_view_pick(self);
+        render_ui::focus_shortcut(self, ui);
         let show_timeline = self.ui.show_timeline && !render_workspace::active(self);
         let left_timeline = show_timeline && self.preferences.timeline_left;
         timeline_left::animate_folds(self, ui.ctx());
@@ -2228,7 +2261,7 @@ impl SolveApp {
             timeline::timeline(self, ui);
         }
         // Browser hugs its contents in either layout; it never becomes a full-height blank column.
-        if !self.ui.show_browser {
+        if !self.ui.show_browser || render_ui::focused(self) {
             self.shell.browser = None;
             shell::register_panel(self, "render:browser", None, None);
         }
@@ -2281,7 +2314,7 @@ impl SolveApp {
             render_ui::shots_strip(self, ui);
             render_workspace::panel(self, ui);
         }
-        if self.ui.show_browser {
+        if self.ui.show_browser && !render_ui::focused(self) {
             browser::browser(self, ui);
         }
         if floating {

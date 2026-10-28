@@ -8,6 +8,28 @@ fn bar_rect(canvas: Rect) -> Rect {
     crate::navigation_bar_view::measure(canvas, &Default::default(), crate::navigation::NavCaps::MODEL, |_| 0.0).rect
 }
 
+#[test]
+fn render_compass_avoids_the_navigation_bar_on_either_inspector_side() {
+    let viewport = Rect::from_min_size(pos2(0.0, 0.0), vec2(400.0, 140.0));
+    for style in [crate::prefs::NavigatorStyle::Axes, crate::prefs::NavigatorStyle::Cube] {
+        for inspector_left in [false, true] {
+            for bar_left in [false, true] {
+                let navigation = Rect::from_min_size(pos2(if bar_left { 8.0 } else { 312.0 }, 100.0), vec2(80.0, 32.0));
+                let make = if inspector_left { Layout::product_left } else { Layout::product };
+                let layout = make(viewport, viewport, &[], 1.0, style, egui::Vec2::ZERO, navigation);
+                assert!(!layout.axis_view.intersect(navigation).is_positive());
+                if inspector_left != bar_left {
+                    assert!(layout.axis_view.is_positive(), "a bar on the opposite side must leave the compass visible");
+                }
+                if layout.axis_view.is_positive() {
+                    let edge = if inspector_left { layout.axis_view.left() - viewport.left() } else { viewport.right() - layout.axis_view.right() };
+                    assert!(edge.abs() < 0.1, "a compact compass must stay on the Inspector's side");
+                }
+            }
+        }
+    }
+}
+
 fn layout(viewport: Rect, docks: &[Rect], scale: f32, style: crate::prefs::NavigatorStyle, visible: bool) -> Layout {
     let navigation = if visible {
         crate::navigation_bar_view::measure(viewport, &Default::default(), crate::navigation::NavCaps::MODEL, |_| 0.0).rect
@@ -15,6 +37,21 @@ fn layout(viewport: Rect, docks: &[Rect], scale: f32, style: crate::prefs::Navig
         Rect::NOTHING
     };
     Layout::with_content(viewport, viewport, docks, scale, style, egui::Vec2::ZERO, navigation)
+}
+
+#[test]
+fn render_focus_compass_keeps_clear_of_an_exit_chip_on_either_side() {
+    let viewport = Rect::from_min_size(pos2(0.0, 0.0), vec2(1400.0, 900.0));
+    let content = Rect::from_min_max(pos2(0.0, 104.0), viewport.max);
+    let navigation = crate::navigation_bar_view::measure(content, &Default::default(), crate::navigation::NavCaps::RENDER, |_| 0.0).rect;
+    for x in [8.0, 1250.0] {
+        let chip = Rect::from_min_size(pos2(x, content.top()), vec2(142.0, 40.0));
+        let layout = Layout::product(viewport, content, &[chip], 1.0, crate::prefs::NavigatorStyle::Axes, egui::Vec2::ZERO, navigation);
+        assert!(layout.axis_view.is_positive() && layout.navigation.is_positive());
+        assert!(!layout.axis_view.intersect(chip).is_positive());
+        assert!(content.contains_rect(layout.axis_view));
+        assert!(content.contains_rect(layout.navigation));
+    }
 }
 
 #[test]

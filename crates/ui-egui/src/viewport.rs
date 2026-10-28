@@ -5408,6 +5408,13 @@ pub(crate) fn refresh_layout(app: &mut SolveApp, ctx: &egui::Context) {
     if let Some(rect) = app.viewport.rect {
         let docks = crate::shell::covered_rects(app);
         let mut content = crate::shell::content_rect(app, rect);
+        if crate::render_ui::focused(app) {
+            // Focus releases dock reservations while keeping controls below the stage bar.
+            content = rect;
+            for card in &app.shell.cards {
+                content.min.y = (card.bottom() + Tokens::get().space_8).clamp(content.top(), content.bottom());
+            }
+        }
         // The full-height Assistant reserves control space, while rendering and picking
         // keep the original viewport projection. Ordinary feature dialogs do not move controls.
         if app.ui.layout == crate::shell::LayoutMode::Floating
@@ -5428,7 +5435,11 @@ pub(crate) fn refresh_layout(app: &mut SolveApp, ctx: &egui::Context) {
         let style = app.preferences.navigator_style;
         app.viewport.layout = Some(if crate::render_workspace::active(app) {
             let navigation = if app.ui.show_navigation_bar { crate::navigation_bar_view::measured(app, ctx, content).rect } else { Rect::NOTHING };
-            crate::viewport_layout::Layout::product(rect, content, &docks, ctx.pixels_per_point(), style, corner, navigation)
+            if app.preferences.render_inspector_side == "left" {
+                crate::viewport_layout::Layout::product_left(rect, content, &docks, ctx.pixels_per_point(), style, corner, navigation)
+            } else {
+                crate::viewport_layout::Layout::product(rect, content, &docks, ctx.pixels_per_point(), style, corner, navigation)
+            }
         } else {
             let content = if app.ui.layout == crate::shell::LayoutMode::Docked { rect } else { content };
             let navigation = if app.ui.show_navigation_bar { crate::navigation_bar_view::measured(app, ctx, content).rect } else { Rect::NOTHING };

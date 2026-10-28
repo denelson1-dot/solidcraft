@@ -217,6 +217,8 @@ pub(crate) struct WorkspaceOptions<'a> {
     pub icon: &'a str,
     pub bounds: egui::Rect,
     pub fill_height: bool,
+    /// Use the minimum dock width without overwriting its remembered width.
+    pub compact: bool,
 }
 
 pub(crate) struct FeatureOptions<'a> {
@@ -284,14 +286,15 @@ impl<'a> Panel<'a> {
     }
 
     /// Bounded floating workspace card. The shared grip chooses a side; the inner resize
-    /// rail changes its remembered width. Neither gesture changes the document.
+    /// rail changes its remembered width. The inner result pairs the body with a context-menu
+    /// side request, which the caller dispatches through its command. Neither gesture edits the document.
     pub(crate) fn workspace<R>(
         ui: &mut Ui,
         options: WorkspaceOptions<'_>,
         side: &mut String,
         width: &mut f32,
         add: impl FnOnce(&mut Ui) -> R,
-    ) -> Option<egui::InnerResponse<R>> {
+    ) -> Option<egui::InnerResponse<(R, Option<&'static str>)>> {
         let container = super::Container::floating_card(super::Surface::Panel);
         // The ribbon has already reserved the top gap, as for the Design Browser.
         let gap = Tokens::get().space_8;
@@ -305,13 +308,19 @@ impl<'a> Panel<'a> {
             return None;
         }
         let minimum = crate::frame::DIALOG_MIN_W.min(maximum);
-        *width = if width.is_finite() { width.clamp(minimum, maximum) } else { t.form_card_width.min(maximum) };
+        let display_width = if options.compact {
+            minimum
+        } else {
+            *width = if width.is_finite() { width.clamp(minimum, maximum) } else { t.form_card_width.min(maximum) };
+            *width
+        };
         let left = side == "left";
         let rect = egui::Rect::from_min_size(
-            egui::pos2(if left { bounds.left() } else { bounds.right() - *width }, bounds.top()),
-            vec2(*width, bounds.height()),
+            egui::pos2(if left { bounds.left() } else { bounds.right() - display_width }, bounds.top()),
+            vec2(display_width, bounds.height()),
         );
         let ctx = ui.ctx().clone();
+        let mut move_side = None;
         let response = container.area(egui::Id::new(options.id)).fixed_pos(rect.min).movable(false).order(egui::Order::Middle).show(&ctx, |ui| {
             let frame = container.frame(&ctx, t.panel, if left { crate::frame::Side::Left } else { crate::frame::Side::Right }).inner_margin(0.0);
             let content = container.show_frame(ui, frame, bounds, |ui| {
@@ -331,8 +340,17 @@ impl<'a> Panel<'a> {
                 // persistent; their navigation lives in the separately padded body.
                 ui.spacing_mut().item_spacing.y = 0.0;
                 let band = egui::Rect::from_min_size(ui.cursor().min, vec2(ui.available_width(), header_height()));
-                let grip = ui.interact(band, ui.id().with("workspace_grip"), egui::Sense::drag()).on_hover_cursor(egui::CursorIcon::Grab);
+                let grip = ui.interact(band, ui.id().with("workspace_grip"), egui::Sense::click_and_drag()).on_hover_cursor(egui::CursorIcon::Grab);
                 scenario::publish_target(&format!("{}:grip", options.id), grip.rect);
+                super::Menu::context(&grip, |ui| {
+                    let (target, label) = if left { ("right", "Move to right side") } else { ("left", "Move to left side") };
+                    let item = super::MenuItem::new("view.render_dock", label, "").show(ui);
+                    scenario::publish_target(&format!("{}:move_side", options.id), item.rect);
+                    if item.clicked() {
+                        move_side = Some(target);
+                        ui.close();
+                    }
+                });
                 header_impl(ui, (options.icon, None), options.title, None, false, || {});
                 scenario::publish_rect(&format!("{}:header", options.id), band);
                 if grip.dragged() {
@@ -361,13 +379,13 @@ impl<'a> Panel<'a> {
             );
             let resize = ui.interact(rail, ui.id().with("workspace_resize"), egui::Sense::drag()).on_hover_cursor(egui::CursorIcon::ResizeHorizontal);
             scenario::publish_target(&format!("{}:resize", options.id), rail);
-            if resize.dragged() {
+            if resize.dragged() && !options.compact {
                 let delta = ui.input(|i| i.pointer.delta().x) * if left { 1.0 } else { -1.0 };
                 if delta.is_finite() {
                     *width = (*width + delta).clamp(minimum, maximum);
                 }
             }
-            content.inner
+            (content.inner, move_side)
         });
         Some(response)
     }
