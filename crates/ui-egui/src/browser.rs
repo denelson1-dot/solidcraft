@@ -2032,9 +2032,9 @@ impl Entry {
             thing: Thing::Sketch(f.id),
             patterns: crate::sketch_pattern_tree::has_patterns(app, f.id).then(|| format!("s:{}/patterns", f.id)),
             label: if lost {
-                format!("{}  (attachment lost)", f.name)
+                crate::i18n::format("browser.sketch_attachment_lost", &[("name", &crate::i18n::tr_name(&f.name))])
             } else if active {
-                format!("{}  (editing)", f.name)
+                crate::i18n::format("browser.sketch_editing", &[("name", &crate::i18n::tr_name(&f.name))])
             } else {
                 f.name.clone()
             },
@@ -2427,7 +2427,8 @@ fn entry_row(
     let pattern_key = e.patterns.as_deref();
     let patterns_open = pattern_key.is_some_and(|key| is_open(app, key, true));
     let rect = row_rect(ui);
-    if !ui.is_rect_visible(rect) && !patterns_open && !(folder == "bodies" && app.tree.reveal.as_deref() == Some(e.key.as_str())) {
+    let revealed = folder == "bodies" && app.tree.reveal.as_ref().is_some_and(|b| e.row_key.strip_prefix("b:") == Some(b.as_str()));
+    if !ui.is_rect_visible(rect) && !patterns_open && !revealed {
         ui.allocate_space(rect.size());
         return;
     }
@@ -2477,10 +2478,7 @@ fn entry_row(
     }
     if r.double && folder == "sketches" {
         if let Ok(id) = e.key.parse() {
-            if let Some(path) = path {
-                let _ = app.run("component.activate", json!({"component": comp,"occurrence":path.last(),"path":path}));
-            }
-            app.edit_sketch(id);
+            app.edit_sketch_in(id, path.map(|path| (comp, path)));
         }
     } else if r.clicked {
         let shift = ui.input(|i| i.modifiers.shift);
